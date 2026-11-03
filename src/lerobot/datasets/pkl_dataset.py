@@ -15,10 +15,44 @@ import struct
 import threading
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MAGIC = b"EVOPKL1\n"
 RECORD_HEADER = struct.Struct("<QI")
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def encode_png_rgb(image, compression=1):
+    """Encode uint8 RGB without changing channel order or pixel values."""
+    import cv2
+    import numpy as np
+
+    if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("PNG capture requires an HWC uint8 RGB image")
+    ok, encoded = cv2.imencode(
+        ".png", cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_PNG_COMPRESSION, compression],
+    )
+    if not ok:
+        raise RuntimeError("PNG encoding failed")
+    return encoded.tobytes()
+
+
+def decode_png_rgb(encoded, shape):
+    """Validate/decode one RGB8 PNG; called only by offline conversion."""
+    import cv2
+    import numpy as np
+
+    if not isinstance(encoded, bytes) or not encoded.startswith(PNG_SIGNATURE) or len(encoded) < 33:
+        raise ValueError("Expected PNG image bytes")
+    width, height, depth, color = struct.unpack(">IIBB", encoded[16:26])
+    if tuple(shape) != (height, width, 3) or depth != 8 or color != 2:
+        raise ValueError("PNG shape, bit depth or color type differs from RGB8 schema")
+    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is None or image.dtype != np.uint8 or image.shape != tuple(shape):
+        raise ValueError("PNG decoding failed or image differs from schema")
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
 def atomic_json(path: Path, data: dict) -> None:
@@ -54,14 +88,15 @@ def iter_records(path: Path):
 class PklDataset:
     """Small adapter for this repository's recording_loop and record entrypoint.
 
-    add_frame snapshots arrays on the producer; serialization/fsync run on one
-    background thread. Queue capacity counts complete three-camera samples.
+    add_frame snapshots arrays on the producer; PNG encoding, serialization and
+    fsync run in the background. Queue capacity counts complete camera groups.
     """
 
     @classmethod
     def create(cls, repo_id, fps, features, root=None, robot_type=None,
                use_videos=True, vcodec="libsvtav1", queue_frames=30,
-               shard_mb=1024, sync_seconds=1.0, **unused):
+               shard_mb=1024, sync_seconds=1.0, image_encoding="png",
+               png_compression=1, encoder_threads=3, **unused):
         from lerobot.datasets.lerobot_dataset import VALID_VIDEO_CODECS, LeRobotDatasetMetadata
         from lerobot.datasets.utils import validate_frame
 
@@ -71,14 +106,29 @@ class PklDataset:
             raise ValueError("Invalid PKL queue/shard/sync configuration")
         if vcodec not in VALID_VIDEO_CODECS:
             raise ValueError(f"Invalid vcodec '{vcodec}'. Must be one of: {sorted(VALID_VIDEO_CODECS)}")
+        cls._validate_encoding(image_encoding, png_compression, encoder_threads)
         meta = LeRobotDatasetMetadata.create(
             repo_id=repo_id, fps=fps, features=features, root=root,
             robot_type=robot_type, use_videos=True,
         )
-        return cls(meta, vcodec, queue_frames, shard_mb, sync_seconds, validate_frame)
+        return cls(meta, vcodec, queue_frames, shard_mb, sync_seconds, validate_frame,
+                   image_encoding, png_compression, encoder_threads)
+
+    @staticmethod
+    def _validate_encoding(image_encoding, png_compression, encoder_threads):
+        if image_encoding not in {"raw", "png"}:
+            raise ValueError("PKL image_encoding must be raw or png")
+        if not isinstance(png_compression, int) or not 0 <= png_compression <= 9:
+            raise ValueError("PNG compression must be an integer in [0, 9]")
+        if not isinstance(encoder_threads, int) or encoder_threads < 1:
+            raise ValueError("PNG encoder_threads must be positive")
+        if image_encoding == "png":
+            import cv2  # noqa: F401 -- fail before creating the capture directory
 
     def __init__(self, meta, vcodec="libsvtav1", queue_frames=30,
-                 shard_mb=1024, sync_seconds=1.0, validate_frame=None):
+                 shard_mb=1024, sync_seconds=1.0, validate_frame=None,
+                 image_encoding="png", png_compression=1, encoder_threads=3):
+        self._validate_encoding(image_encoding, png_compression, encoder_threads)
         self.meta = meta
         self.root = Path(meta.root)
         self.repo_id = meta.repo_id
@@ -87,6 +137,9 @@ class PklDataset:
         self.num_episodes = 0
         self.image_writer = None
         self._validate = validate_frame
+        self._image_encoding = image_encoding
+        self._png_compression = png_compression
+        self._image_keys = [key for key, feature in self.features.items() if feature["dtype"] in {"image", "video"}]
         self._queue = queue.Queue(maxsize=queue_frames)
         self._shard_bytes = int(shard_mb * 1024 * 1024)
         self._sync_seconds = sync_seconds
@@ -99,13 +152,17 @@ class PklDataset:
         (self.root / "episodes").mkdir()
         with (self.root / "capture.pkl").open("xb") as stream:
             pickle.dump({
-                "format": "evo-pkl-v1", "fps": self.fps,
+                "format": "evo-pkl-v2" if image_encoding == "png" else "evo-pkl-v1", "fps": self.fps,
                 "repo_id": self.repo_id, "robot_type": meta.info["robot_type"],
                 "features": self.features, "vcodec": vcodec,
                 "timestamp_mode": "frame_index/fps",
+                "image_encoding": image_encoding, "image_color_mode": "RGB",
+                "png_compression": png_compression if image_encoding == "png" else None,
             }, stream, protocol=5)
             stream.flush()
             os.fsync(stream.fileno())
+        self._encoder = (ThreadPoolExecutor(max_workers=encoder_threads, thread_name_prefix="png-encoder")
+                         if image_encoding == "png" else None)
         self._thread = threading.Thread(target=self._run, name="pkl-writer", daemon=False)
         self._thread.start()
 
@@ -211,6 +268,13 @@ class PklDataset:
                             written = 0
                         if active_attempt != attempt or payload["frame_index"] != written:
                             raise ValueError("PKL writer frame order mismatch")
+                        if self._encoder is not None:
+                            futures = {
+                                key: self._encoder.submit(encode_png_rgb, payload["frame"][key], self._png_compression)
+                                for key in self._image_keys
+                            }
+                            for key, future in futures.items():
+                                payload["frame"][key] = future.result()
                         body = pickle.dumps(payload, protocol=5)
                         if stream is not None and stream.tell() + len(body) + RECORD_HEADER.size > self._shard_bytes:
                             finish_shard()
@@ -248,5 +312,9 @@ class PklDataset:
             self._error = error
             logging.exception("PKL background writer failed")
         finally:
-            if stream is not None:
-                stream.close()
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                if self._encoder is not None:
+                    self._encoder.shutdown(wait=True)

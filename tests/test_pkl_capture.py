@@ -72,7 +72,7 @@ class CaptureTests(unittest.TestCase):
         meta = SimpleNamespace(root=root, repo_id="local/synthetic", features=features(), fps=30,
                                info={"robot_type": "synthetic"}, _close_writer=lambda: None)
         # Tiny shards force rollover in a small, fast test.
-        return storage.PklDataset(meta, queue_frames=2, shard_mb=0.002, sync_seconds=0.05)
+        return storage.PklDataset(meta, queue_frames=2, shard_mb=0.002, sync_seconds=0.05, image_encoding="raw")
 
     def completed(self):
         writer = self.writer()
@@ -152,14 +152,14 @@ class CaptureTests(unittest.TestCase):
         output = self.root / "converted"
         output.mkdir()
         (output / "conversion.complete.json").write_text(json.dumps({"episodes": 1, "frames": 3}))
-        with patch.object(converter, "verify_output"), patch.object(converter.subprocess, "run") as run:
-            run.side_effect = [
-                subprocess.CompletedProcess([], 0, stdout='{"status":"ready"}', stderr=""),
-                subprocess.CalledProcessError(1, ["scp"]),
-            ]
+        with (patch.object(converter, "verify_output"),
+              patch.object(converter.subprocess, "run", return_value=
+                           subprocess.CompletedProcess([], 0, stdout='{"status":"ready"}', stderr="")) as run,
+              patch.object(converter, "send_directory", side_effect=subprocess.CalledProcessError(1, ["ssh"])) as transfer):
             with self.assertRaises(subprocess.CalledProcessError):
                 converter.upload(output, "example.invalid", "test", "/data/datasets")
-            self.assertEqual(run.call_count, 2)  # remote final verification/rename not invoked
+            self.assertEqual(run.call_count, 1)  # only prepare, no publication after transfer failure
+            transfer.assert_called_once()
         raw = self.completed()
         (self.root / "upload.json").write_text(json.dumps({
             "upload_host": "example.invalid", "upload_user": "test", "upload_dir": "/data/datasets",
@@ -185,6 +185,7 @@ class CaptureTests(unittest.TestCase):
             repo_id="local/synthetic", fps=30, features=features(),
             root=self.root / "raw-integration", robot_type="synthetic",
             queue_frames=2, shard_mb=1,
+            image_encoding="raw",
         )
         for index in range(3):
             sample = frame(index)

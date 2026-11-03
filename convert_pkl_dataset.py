@@ -14,15 +14,135 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import uuid
 from collections import defaultdict
-from pathlib import Path
+from contextlib import contextmanager, suppress
+from pathlib import Path, PurePosixPath
+
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-from lerobot.datasets.pkl_dataset import atomic_json, iter_records
+from lerobot.datasets.pkl_dataset import atomic_json, decode_png_rgb, iter_records
 
 DEFAULT_FIELDS = {"index", "frame_index", "timestamp", "episode_index", "task_index"}
 OFFLINE_WRITE_CHUNK_FRAMES = 30
+PROGRESS_ENABLED = True
+
+
+def progress_bar(*args, **kwargs):
+    return tqdm(*args, disable=not PROGRESS_ENABLED, dynamic_ncols=True, mininterval=0.25, **kwargs)
+
+
+@contextmanager
+def refresh_progress(bar):
+    """Refresh elapsed time while the original video encoder is blocking."""
+    stopped = threading.Event()
+
+    def refresh():
+        while not stopped.wait(1):
+            bar.refresh()
+
+    thread = threading.Thread(target=refresh, daemon=True) if PROGRESS_ENABLED else None
+    if thread is not None:
+        thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        if thread is not None:
+            thread.join()
+
+
+# A bounded-memory file stream over SSH. Progress counts payload bytes actually
+# written into SSH's stdin; remote acknowledgement and SHA256 precede success.
+REMOTE_RECEIVE_SCRIPT = '''import json,os,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+root.mkdir(exist_ok=False)
+source=sys.stdin.buffer
+received=0
+files=0
+while True:
+    line=source.readline(65537)
+    if not line or len(line)>65536 or not line.endswith(b'\\n'):
+        raise ValueError('Missing or oversized upload header')
+    header=json.loads(line)
+    if header.get('done') is True:
+        break
+    relative=pathlib.PurePosixPath(header['path'])
+    size=header['size']
+    if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+        raise ValueError('Invalid upload path')
+    if type(size) is not int or size<0:
+        raise ValueError('Invalid upload size')
+    target=root.joinpath(*relative.parts)
+    if not target.resolve().is_relative_to(root.resolve()):
+        raise ValueError('Upload path escapes destination')
+    target.parent.mkdir(parents=True,exist_ok=True)
+    with target.open('xb') as output:
+        remaining=size
+        while remaining:
+            chunk=source.read(min(1048576,remaining))
+            if not chunk:
+                raise ValueError('Upload ended before file was complete')
+            output.write(chunk)
+            remaining-=len(chunk)
+            received+=len(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    files+=1
+print(json.dumps({'status':'received','bytes':received,'files':files}))
+'''
+
+
+def send_directory(command, output):
+    """Stream files without buffering a dataset or requiring SCP's TTY meter."""
+    files = sorted(path for path in output.rglob("*") if path.is_file())
+    if any(path.is_symlink() for path in output.rglob("*")):
+        raise ValueError("Upload source contains a symlink")
+    total = sum(path.stat().st_size for path in files)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with progress_bar(total=total, desc="Upload", unit="B", unit_scale=True, unit_divisor=1024) as bar:
+            for path in files:
+                relative = path.relative_to(output).as_posix()
+                size = path.stat().st_size
+                bar.set_postfix_str(relative[-55:], refresh=False)
+                process.stdin.write((json.dumps({"path": relative, "size": size}) + "\n").encode())
+                with path.open("rb") as source:
+                    remaining = size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ValueError(f"Upload source changed while reading: {path}")
+                        process.stdin.write(chunk)
+                        remaining -= len(chunk)
+                        bar.update(len(chunk))
+            process.stdin.write(b'{"done":true}\n')
+            process.stdin.close()
+            process.stdin = None
+            stdout, stderr = process.communicate()
+            if process.returncode:
+                detail = stderr.decode(errors="replace").strip() or f"exit status {process.returncode}"
+                raise RuntimeError("SSH upload failed: " + detail)
+            acknowledgement = json.loads(stdout)
+            if acknowledgement != {"status": "received", "bytes": total, "files": len(files)}:
+                raise ValueError("Remote upload acknowledgement does not match sent files")
+    except BaseException as error:
+        if process.stdin is not None:
+            with suppress(OSError):
+                process.stdin.close()
+            process.stdin = None
+        if process.poll() is None:
+            process.terminate()
+        try:
+            _, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr = process.communicate()
+        if isinstance(error, BrokenPipeError):
+            raise RuntimeError("SSH upload failed: " + stderr.decode(errors="replace")) from error
+        raise
 
 # These helpers run on the upload server using only Python's standard library.
 # Verification uses the fresh local manifest sent over SSH stdin, not solely a
@@ -59,8 +179,11 @@ parent,temporary,final=map(pathlib.Path,sys.argv[1:])
 expected=json.load(sys.stdin)
 parent.mkdir(parents=True,exist_ok=True)
 if final.exists() or final.is_symlink():
-    verify_directory(final,expected)
-    print(json.dumps({'status':'already_complete','path':str(final)}))
+    if final.is_dir() and not final.is_symlink() and not any(final.iterdir()):
+        print(json.dumps({'status':'ready'}))
+    else:
+        verify_directory(final,expected)
+        print(json.dumps({'status':'already_complete','path':str(final)}))
 else:
     if temporary.exists() or temporary.is_symlink():
         raise FileExistsError('Remote temporary destination already exists')
@@ -71,6 +194,10 @@ REMOTE_PUBLISH_SCRIPT = REMOTE_UPLOAD_HELPERS + '''
 temporary,final=map(pathlib.Path,sys.argv[1:])
 expected=json.load(sys.stdin)
 verify_directory(temporary,expected)
+if final.is_dir() and not final.is_symlink() and not any(final.iterdir()):
+    # Remove only a confirmed empty placeholder directory. rmdir fails safely
+    # if another process creates contents; never merge or recursively delete.
+    final.rmdir()
 if final.exists() or final.is_symlink():
     verify_directory(final,expected)
     status='already_complete'
@@ -97,8 +224,11 @@ def capture_info(source):
         raise ValueError("Capture is not closed. Finish recording successfully before converting")
     with (root / "capture.pkl").open("rb") as stream:
         info = pickle.load(stream)
-    if info.get("format") != "evo-pkl-v1" or info.get("fps") != 30:
-        raise ValueError("Expected an evo-pkl-v1 capture recorded at 30 FPS")
+    if info.get("format") not in {"evo-pkl-v1", "evo-pkl-v2"} or info.get("fps") != 30:
+        raise ValueError("Expected an evo-pkl-v1/v2 capture recorded at 30 FPS")
+    encoding = info.get("image_encoding", "raw")
+    if encoding not in {"raw", "png"} or (info["format"] == "evo-pkl-v2" and encoding != "png"):
+        raise ValueError("Unsupported PKL image encoding")
     episodes = []
     for path in (root / "episodes").glob("attempt-*/ready.json"):
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -121,6 +251,11 @@ def episode_records(folder, descriptor):
 
 
 def validate_capture(info, episodes):
+    with progress_bar(total=sum(data["frames"] for _, data in episodes), desc="Validate PKL", unit="frame") as bar:
+        return _validate_capture(info, episodes, bar)
+
+
+def _validate_capture(info, episodes, bar):
     required = (set(info["features"]) - DEFAULT_FIELDS) | {"task"}
     total = 0
     for folder, descriptor in episodes:
@@ -137,12 +272,15 @@ def validate_capture(info, episodes):
                 if key in DEFAULT_FIELDS or feature["dtype"] == "string":
                     continue
                 value = frame[key]
+                if feature["dtype"] in {"image", "video"} and info.get("image_encoding", "raw") == "png":
+                    value = decode_png_rgb(value, feature["shape"])
                 if tuple(value.shape) != tuple(feature["shape"]):
                     raise ValueError(f"Shape mismatch: {folder}/{key}")
                 dtype = "uint8" if feature["dtype"] in ("video", "image") else feature["dtype"]
                 if str(value.dtype) != dtype:
                     raise ValueError(f"Dtype mismatch: {folder}/{key}")
             count += 1
+            bar.update(1)
         if count != descriptor["frames"]:
             raise ValueError(f"Frame count mismatch in {folder}")
         total += count
@@ -195,18 +333,48 @@ def convert(source, output):
         raise FileExistsError(f"Use a new output path; refusing to overwrite {output} or {staging}")
     output.parent.mkdir(parents=True, exist_ok=True)
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    dataset = LeRobotDataset.create(
+
+    class PngReplayDataset(LeRobotDataset):
+        """Use original metadata/video logic while writing existing PNG bytes."""
+
+        def add_frame(self, frame):
+            decoded = dict(frame)
+            self._encoded_images = {}
+            try:
+                for key, feature in self.features.items():
+                    if feature["dtype"] in {"image", "video"}:
+                        image = decode_png_rgb(frame[key], feature["shape"])
+                        decoded[key] = image
+                        self._encoded_images[id(image)] = frame[key]
+                super().add_frame(decoded)
+            finally:
+                self._encoded_images = {}
+
+        def _save_image(self, image, fpath, compress_level=1):
+            encoded = self._encoded_images.get(id(image))
+            if encoded is None:
+                return super()._save_image(image, fpath, compress_level)
+            # Reuse capture PNG bytes exactly; no second PNG encode.
+            Path(fpath).write_bytes(encoded)
+
+    png_capture = info.get("image_encoding", "raw") == "png"
+    dataset_class = PngReplayDataset if png_capture else LeRobotDataset
+    dataset = dataset_class.create(
         repo_id=info["repo_id"], fps=info["fps"], features=info["features"],
         root=staging, robot_type=info["robot_type"], use_videos=True,
-        image_writer_threads=4, image_writer_processes=0,
+        image_writer_threads=0 if png_capture else 4, image_writer_processes=0,
         batch_encoding_size=1, vcodec=info["vcodec"],
     )
+    frames_bar = progress_bar(total=total, desc="Frames prepared", unit="frame", position=0)
+    episodes_bar = progress_bar(total=len(episodes), desc="Episodes encoded", unit="episode", position=1)
     try:
         for folder, descriptor in episodes:
+            frames_bar.set_postfix_str(f"episode {descriptor['episode_index'] + 1}/{len(episodes)}", refresh=False)
             for frame_count, packet in enumerate(episode_records(folder, descriptor), start=1):
                 # Original add_frame validates keys before generating timestamp.
                 # Keep timestamp out of frame; original code regenerates n/fps.
                 dataset.add_frame(packet["frame"])
+                frames_bar.update(1)
                 if frame_count % OFFLINE_WRITE_CHUNK_FRAMES == 0:
                     # Original AsyncImageWriter has an unbounded queue. Drain
                     # regularly so a fast raw reader cannot queue a whole
@@ -220,13 +388,20 @@ def convert(source, output):
                     dataset.episode_buffer[key] = [
                         np.asarray(value).reshape(())[()] for value in dataset.episode_buffer[key]
                     ]
-            dataset.save_episode(extra_episode_metadata=descriptor["metadata"])
-            print(f"Converted episode {descriptor['episode_index'] + 1}/{len(episodes)}", flush=True)
+            episodes_bar.set_postfix_str(f"encoding episode {descriptor['episode_index'] + 1}")
+            with refresh_progress(episodes_bar):
+                dataset.save_episode(extra_episode_metadata=descriptor["metadata"])
+            episodes_bar.update(1)
+            episodes_bar.set_postfix_str("episode complete")
+            tqdm.write(f"Converted episode {descriptor['episode_index'] + 1}/{len(episodes)}")
     finally:
+        frames_bar.close()
+        episodes_bar.close()
         try:
             dataset.stop_image_writer()
         finally:
             dataset.finalize()
+    print("Verifying converted dataset...", flush=True)
     verify_output(staging, len(episodes), total)
     atomic_json(staging / "conversion.complete.json", {
         "episodes": len(episodes), "frames": total, "fps": info["fps"],
@@ -238,20 +413,25 @@ def convert(source, output):
 
 def checksum_manifest(output):
     manifest = {}
-    for path in sorted(output.rglob("*")):
+    paths = sorted(output.rglob("*"))
+    for path in paths:
         if path.is_symlink():
             raise ValueError(f"Unexpected output symlink: {path}")
-        if path.is_file() and path.relative_to(output).as_posix() != "upload.sha256.json":
+    files = [path for path in paths if path.is_file() and path.relative_to(output).as_posix() != "upload.sha256.json"]
+    with progress_bar(total=sum(path.stat().st_size for path in files), desc="Local SHA256",
+                      unit="B", unit_scale=True, unit_divisor=1024) as bar:
+        for path in files:
             digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                     digest.update(chunk)
+                    bar.update(len(chunk))
             manifest[path.relative_to(output).as_posix()] = digest.hexdigest()
     (output / "upload.sha256.json").write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
     return manifest
 
 
-def upload(output, host, user, remote_parent, port=22):
+def upload(output, host, user, remote_directory, port=22):
     output = Path(output).resolve()
     marker = json.loads((output / "conversion.complete.json").read_text(encoding="utf-8"))
     verify_output(output, marker["episodes"], marker["frames"])
@@ -259,16 +439,17 @@ def upload(output, host, user, remote_parent, port=22):
         raise ValueError("Upload host must be an IPv4 address or DNS hostname")
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", user):
         raise ValueError("Invalid SSH username")
-    # Restrict remote paths to a portable shell/SFTP-safe form for both old and new scp.
-    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", remote_parent) or ".." in remote_parent.split("/"):
+    # Keep remote paths portable and easy to reuse in shell commands.
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", remote_directory) or ".." in remote_directory.split("/"):
         raise ValueError("Use an absolute remote directory with ASCII letters/digits, /, _, ., -")
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", output.name):
-        raise ValueError("For SCP upload, use an ASCII output directory name without spaces")
+    final = PurePosixPath(remote_directory).as_posix()
+    if not PurePosixPath(final).name:
+        raise ValueError("Upload destination must be a dataset directory, not filesystem root")
+    remote_parent = PurePosixPath(final).parent.as_posix()
     if not 1 <= port <= 65535:
         raise ValueError("Invalid SSH port")
     manifest = checksum_manifest(output)
     target = f"{user}@{host}"
-    final = remote_parent.rstrip("/") + "/" + output.name
     temporary = final + ".uploading-" + uuid.uuid4().hex[:12]
 
     def ssh_python(code, *arguments):
@@ -293,10 +474,9 @@ def upload(output, host, user, remote_parent, port=22):
         return
     if preparation.get("status") != "ready":
         raise ValueError("Unexpected remote upload preparation response")
-    subprocess.run([
-        "scp", "-o", "BatchMode=yes", "-P", str(port), "-r",
-        str(output), f"{target}:{temporary}",
-    ], check=True)
+    receive_command = shlex.join(["python3", "-c", REMOTE_RECEIVE_SCRIPT, temporary])
+    send_directory(["ssh", "-o", "BatchMode=yes", "-p", str(port), target, receive_command], output)
+    print("Verifying remote SHA256 before publishing...", flush=True)
     publication = ssh_python(REMOTE_PUBLISH_SCRIPT, temporary, final)
     if publication.get("status") not in {"complete", "already_complete"}:
         raise ValueError("Unexpected remote upload publication response")
@@ -315,6 +495,7 @@ def parse_upload_target(target):
 
 
 def main():
+    global PROGRESS_ENABLED
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", help="Trusted capture.pkl or capture directory")
     parser.add_argument("--output", type=Path, help="New dataset directory; defaults to <capture>-dataset")
@@ -325,12 +506,14 @@ def main():
                         default=default_config if default_config.is_file() else None,
                         help="Upload defaults; automatically reads upload.json beside this script")
     parser.add_argument("--no-upload", action="store_true", help="Only convert, even if upload.json exists")
-    parser.add_argument("--upload-target", help="SSH destination shorthand: username@host:/absolute/path")
+    parser.add_argument("--upload-target", help="Exact dataset destination: username@host:/absolute/path")
     parser.add_argument("--upload-host")
     parser.add_argument("--upload-user")
-    parser.add_argument("--upload-dir", help="Remote parent directory; dataset name is appended")
+    parser.add_argument("--upload-dir", help="Exact remote dataset directory; local directory name is not appended")
     parser.add_argument("--upload-port", type=int)
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bars for log-only runs")
     args = parser.parse_args()
+    PROGRESS_ENABLED = not args.no_progress
     settings = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
     port = args.upload_port or settings.get("upload_port", 22)
     if args.no_upload:

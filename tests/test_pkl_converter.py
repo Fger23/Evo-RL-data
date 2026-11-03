@@ -1,6 +1,7 @@
 """Converter backpressure and upload publication tests; no SSH/SCP execution."""
 import importlib.util
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -77,7 +78,8 @@ class ConverterTests(unittest.TestCase):
             kwargs["root"].mkdir()
             return dataset
 
-        fake_module = SimpleNamespace(LeRobotDataset=SimpleNamespace(create=create))
+        FakeDataset.create = staticmethod(create)
+        fake_module = SimpleNamespace(LeRobotDataset=FakeDataset)
         info = {"repo_id": "local/test", "fps": 30, "features": {}, "robot_type": "synthetic", "vcodec": "h264"}
         episodes = [(raw / "episode", {"episode_index": 0, "frames": 61, "metadata": {}})]
         with patch.dict(sys.modules, {"lerobot.datasets.lerobot_dataset": fake_module}), \
@@ -127,13 +129,62 @@ class ConverterTests(unittest.TestCase):
     def test_completed_upload_retry_skips_scp(self):
         local, _ = self.output()
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps({
-            "status": "already_complete", "path": "/remote/local-dataset",
+            "status": "already_complete", "path": "/remote",
         }), stderr="")
         with patch.object(converter, "verify_output"), patch.object(converter.subprocess, "run", return_value=completed) as run:
             converter.upload(local, "example.invalid", "test", "/remote")
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0][0], "ssh")
         self.assertEqual(json.loads(run.call_args.kwargs["input"]), converter.checksum_manifest(local))
+        remote_arguments = shlex.split(run.call_args.args[0][-1])
+        self.assertEqual(remote_arguments[-1], "/remote")
+        self.assertEqual(remote_arguments[-3], "/")
+
+    def test_upload_uses_exact_target_without_local_directory_name(self):
+        local, _ = self.output()
+        prepared = subprocess.CompletedProcess([], 0, stdout='{"status":"ready"}', stderr="")
+        published = subprocess.CompletedProcess([], 0, stdout='{"status":"complete","path":"/remote/test"}', stderr="")
+        with (patch.object(converter, "verify_output"),
+              patch.object(converter.subprocess, "run", side_effect=[prepared, published]) as run,
+              patch.object(converter, "send_directory") as send):
+            converter.upload(local, "example.invalid", "test", "/remote/test/", 2222)
+        prepare_arguments = shlex.split(run.call_args_list[0].args[0][-1])
+        publish_arguments = shlex.split(run.call_args_list[1].args[0][-1])
+        self.assertEqual(prepare_arguments[-3], "/remote")
+        self.assertEqual(prepare_arguments[-1], "/remote/test")
+        self.assertTrue(prepare_arguments[-2].startswith("/remote/test.uploading-"))
+        self.assertEqual(publish_arguments[-1], "/remote/test")
+        self.assertNotIn("local-dataset", prepare_arguments[-1])
+        transfer_arguments = shlex.split(send.call_args.args[0][-1])
+        self.assertEqual(transfer_arguments[-1], prepare_arguments[-2])
+
+    def test_existing_empty_target_is_published_in_place(self):
+        local, manifest = self.output()
+        parent = self.root / "remote"
+        final = parent / "test"
+        final.mkdir(parents=True)
+        temporary = parent / "test.uploading"
+        prepared = self.remote_helper(converter.REMOTE_PREPARE_SCRIPT, manifest, parent, temporary, final)
+        self.assertEqual(json.loads(prepared.stdout)["status"], "ready")
+        shutil.copytree(local, temporary)
+        self.remote_helper(converter.REMOTE_PUBLISH_SCRIPT, manifest, temporary, final)
+        self.assertTrue((final / "data/example.bin").is_file())
+        self.assertFalse((final / local.name).exists())
+
+    def test_existing_unrelated_target_is_preserved(self):
+        local, manifest = self.output()
+        parent = self.root / "remote"
+        final = parent / "test"
+        final.mkdir(parents=True)
+        (final / "existing.txt").write_text("keep this data")
+        temporary = parent / "test.uploading"
+        prepared = self.remote_helper(converter.REMOTE_PREPARE_SCRIPT, manifest, parent, temporary, final, check=False)
+        self.assertNotEqual(prepared.returncode, 0)
+        shutil.copytree(local, temporary)
+        published = self.remote_helper(converter.REMOTE_PUBLISH_SCRIPT, manifest, temporary, final, check=False)
+        self.assertNotEqual(published.returncode, 0)
+        self.assertEqual((final / "existing.txt").read_text(), "keep this data")
+        self.assertTrue(temporary.exists())
 
     def test_upload_target_and_no_upload_placeholder_override(self):
         self.assertEqual(converter.parse_upload_target("test@example.invalid:/data/datasets"),

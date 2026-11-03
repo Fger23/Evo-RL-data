@@ -189,6 +189,9 @@ class DatasetRecordConfig:
     pkl_queue_frames: int = 30
     pkl_shard_mb: int = 1024
     pkl_sync_seconds: float = 1.0
+    pkl_image_encoding: str = "png"
+    pkl_png_compression: int = 1
+    pkl_encoder_threads: int = 3
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -446,6 +449,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 queue_frames=cfg.dataset.pkl_queue_frames,
                 shard_mb=cfg.dataset.pkl_shard_mb,
                 sync_seconds=cfg.dataset.pkl_sync_seconds,
+                image_encoding=cfg.dataset.pkl_image_encoding,
+                png_compression=cfg.dataset.pkl_png_compression,
+                encoder_threads=cfg.dataset.pkl_encoder_threads,
             )
         elif cfg.resume:
             dataset = LeRobotDataset(
