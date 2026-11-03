@@ -1,0 +1,4 @@
+{
+  "upload_target": "用户名@服务器:/绝对目录",
+  "upload_port": 22
+}

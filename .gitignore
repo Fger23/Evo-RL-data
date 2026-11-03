@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+logs/
+data/
+datasets/
+!/src/lerobot/datasets/
+checkpoints/
+*.pkl
+*.mp4
+*.avi
+*.bag
+*.db3
+.env
+*.key
+*.pem
+
+# Local captures and private upload configuration
+upload.json
+*.pkl
+*.partial
+*.converting/
+__pycache__/
+logs/
+outputs/
+run.txt
