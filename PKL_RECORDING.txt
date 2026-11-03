@@ -75,9 +75,14 @@ PNG 字节直接写成临时 PNG，避免重复压缩；旧 RGB 路径每 30 条
 该规则同时适用于 --upload-target、--upload-dir 和 JSON 配置。
 --config 可以指定别处的 JSON 配置；--no-upload 显式关闭本次上传。
 独立的 upload_host/upload_user/upload_dir 配置及对应命令参数仍然支持。
-需要原采集/转换机器能通过 SSH 密钥免交互登录，远端有 python3 和写权限。
+认证支持 SSH 密钥，或私有 upload.json 中的 upload_password 密码字段。
+upload_password 留空时使用 SSH 密钥；Linux 上填写密码后会通过临时 SSH_ASKPASS 自动认证。
+该配置文件已被 Git 忽略，建议 chmod 600 upload.json，不要把真实密码写进公开源码。
+也可以用 --upload-password-env 指定保存密码的环境变量名称。
+密码不放入 SSH 命令行，临时认证脚本用完清理；Windows 端继续使用 SSH 密钥。
+远端需要 python3 和目标目录写权限；第一次连接需确认服务器主机指纹。
 当前实现支持 IPv4/DNS 主机名；实际远程目录应使用无空格的 ASCII 路径。
-本项目没有创建 upload.json，未配置任何真实目标或密码。
+upload.example.json 不包含真实目标或密码；实际 upload.json 只保存在使用它的机器上。
 
 上传在转换与输出校验成功后执行：
   计算文件清单 -> SSH 流式传输到临时目录 -> SSH 核对 SHA-256 -> 发布正式目录。

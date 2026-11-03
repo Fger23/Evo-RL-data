@@ -13,3 +13,4 @@ checkpoints/
 .env
 *.key
 *.pem
+/upload.json

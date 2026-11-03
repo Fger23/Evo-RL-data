@@ -195,7 +195,8 @@ class ConverterTests(unittest.TestCase):
         config = self.root / "upload.json"
         config.write_text(json.dumps({"upload_target": "待填写目标"}), encoding="utf-8")
         raw, output = self.root / "raw", self.root / "converted"
-        with patch.object(converter, "capture_info", return_value=(raw, {}, [])), \
+        with patch.object(converter, "__file__", str(self.root / "convert_pkl_dataset.py")), \
+                patch.object(converter, "capture_info", return_value=(raw, {}, [])), \
                 patch.object(converter, "convert", return_value=output), \
                 patch.object(converter, "upload") as upload:
             with patch.object(sys, "argv", ["convert", "--input", str(raw), "--config", str(config), "--no-upload"]):

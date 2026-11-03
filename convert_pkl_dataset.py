@@ -9,11 +9,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import pickle
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 from collections import defaultdict
@@ -95,13 +97,13 @@ print(json.dumps({'status':'received','bytes':received,'files':files}))
 '''
 
 
-def send_directory(command, output):
+def send_directory(command, output, env=None):
     """Stream files without buffering a dataset or requiring SCP's TTY meter."""
     files = sorted(path for path in output.rglob("*") if path.is_file())
     if any(path.is_symlink() for path in output.rglob("*")):
         raise ValueError("Upload source contains a symlink")
     total = sum(path.stat().st_size for path in files)
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     try:
         with progress_bar(total=total, desc="Upload", unit="B", unit_scale=True, unit_divisor=1024) as bar:
             for path in files:
@@ -431,7 +433,41 @@ def checksum_manifest(output):
     return manifest
 
 
-def upload(output, host, user, remote_directory, port=22):
+@contextmanager
+def ssh_authentication(password):
+    """Use a private configuration password without exposing it in SSH argv."""
+    if password is None:
+        yield ["-o", "BatchMode=yes"], None
+        return
+    if not isinstance(password, str) or not password:
+        raise ValueError("upload_password must be a nonempty string, or omitted for SSH keys")
+    if os.name != "posix":
+        raise RuntimeError("Password upload requires Linux/macOS; use SSH keys on Windows")
+    with tempfile.TemporaryDirectory(prefix="evo-ssh-auth-") as directory:
+        helper = Path(directory) / "askpass"
+        helper.write_text(
+            f"#!{sys.executable}\nimport os\nprint(os.environ['EVO_SSH_UPLOAD_PASSWORD'])\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        environment = dict(os.environ)
+        environment.update(SSH_ASKPASS=str(helper), SSH_ASKPASS_REQUIRE="force",
+                           DISPLAY=environment.get("DISPLAY") or ":0",
+                           EVO_SSH_UPLOAD_PASSWORD=password)
+        try:
+            yield ["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes",
+                   "-o", "PreferredAuthentications=password,keyboard-interactive",
+                   "-o", "NumberOfPasswordPrompts=1"], environment
+        finally:
+            environment.pop("EVO_SSH_UPLOAD_PASSWORD", None)
+
+
+def upload(output, host, user, remote_directory, port=22, password=None):
+    with ssh_authentication(password) as (options, environment):
+        return _upload_dataset(output, host, user, remote_directory, port, options, environment)
+
+
+def _upload_dataset(output, host, user, remote_directory, port, ssh_options, environment):
     output = Path(output).resolve()
     marker = json.loads((output / "conversion.complete.json").read_text(encoding="utf-8"))
     verify_output(output, marker["episodes"], marker["frames"])
@@ -456,9 +492,9 @@ def upload(output, host, user, remote_directory, port=22):
         command = shlex.join(["python3", "-c", code, *arguments])
         try:
             result = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-p", str(port), target, command],
+                ["ssh", *ssh_options, "-p", str(port), target, command],
                 input=json.dumps(manifest, ensure_ascii=True),
-                text=True, capture_output=True, check=True,
+                text=True, capture_output=True, check=True, env=environment,
             )
         except subprocess.CalledProcessError as error:
             detail = error.stderr.strip() if error.stderr else f"SSH exited with status {error.returncode}"
@@ -475,7 +511,7 @@ def upload(output, host, user, remote_directory, port=22):
     if preparation.get("status") != "ready":
         raise ValueError("Unexpected remote upload preparation response")
     receive_command = shlex.join(["python3", "-c", REMOTE_RECEIVE_SCRIPT, temporary])
-    send_directory(["ssh", "-o", "BatchMode=yes", "-p", str(port), target, receive_command], output)
+    send_directory(["ssh", *ssh_options, "-p", str(port), target, receive_command], output, env=environment)
     print("Verifying remote SHA256 before publishing...", flush=True)
     publication = ssh_python(REMOTE_PUBLISH_SCRIPT, temporary, final)
     if publication.get("status") not in {"complete", "already_complete"}:
@@ -511,6 +547,7 @@ def main():
     parser.add_argument("--upload-user")
     parser.add_argument("--upload-dir", help="Exact remote dataset directory; local directory name is not appended")
     parser.add_argument("--upload-port", type=int)
+    parser.add_argument("--upload-password-env", help="Read SSH password from this environment variable")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bars for log-only runs")
     args = parser.parse_args()
     PROGRESS_ENABLED = not args.no_progress
@@ -548,7 +585,14 @@ def main():
         output = args.output or root.with_name(root.name + "-dataset")
         output = convert(args.input, output)
     if host:
-        upload(output, host, user, remote, port)
+        password_env = args.upload_password_env or settings.get("upload_password_env")
+        password = os.environ.get(password_env) if password_env else settings.get("upload_password")
+        if password_env and not password:
+            parser.error("The configured SSH password environment variable is empty or missing")
+        if password:
+            upload(output, host, user, remote, port, password=password)
+        else:
+            upload(output, host, user, remote, port)
 
 
 if __name__ == "__main__":
