@@ -88,6 +88,38 @@ T = TypeVar("T")
 """
 
 
+class JointActionFilter:
+    def __init__(self, alpha=0.1):
+        self.alpha = alpha
+        self.prev = {}
+
+    def reset(self):
+        self.prev.clear()
+
+    def __call__(self, action):
+        result = dict(action)
+
+        for key, value in action.items():
+            if not key.endswith(".pos"):
+                continue
+
+            # 先不处理夹爪
+            if key == "gripper.pos":
+                continue
+
+            current = float(value)
+            last = self.prev.get(key, current)
+
+            filtered = (
+                self.alpha * current
+                + (1 - self.alpha) * last
+            )
+
+            result[key] = filtered
+            self.prev[key] = filtered
+
+        return result
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -110,7 +142,7 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
-    display_compressed_images: bool = False,
+    display_compressed_images: bool = True,
     policy_sync_executor: PolicySyncDualArmExecutor | None = None,
     remote_policy_client: RemotePolicyActionClient | None = None,
     intervention_state_machine_enabled: bool = True,
@@ -249,6 +281,7 @@ def record_loop(
     timestamp = 0 # 从录制开始到当前帧累计运行秒数
     step_idx = 0
     start_episode_t = time.perf_counter() # 录制开始的时间戳
+    # action_filter = JointActionFilter(alpha=0.4)
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter() # 当前帧录制开始的时间戳
 
@@ -379,6 +412,13 @@ def record_loop(
         else:
             action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
 
+        # if policy is None or (
+        #     intervention_enabled
+        #     and intervention_state == INTERVENTION_STATE_ACTIVE
+        # ):
+        #     action_values = action_filter(action_values)
+        # else:
+        #     action_filter.reset()
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))
 

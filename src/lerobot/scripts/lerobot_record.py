@@ -142,7 +142,7 @@ from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import init_rerun
+from lerobot.utils.visualization_utils import init_rerun, with_rerun_cleanup
 
 
 @dataclass
@@ -215,7 +215,7 @@ class RecordConfig:
     # Port of the remote Rerun server
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
-    display_compressed_images: bool = False
+    display_compressed_images: bool = True
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
@@ -374,6 +374,7 @@ def _finish_pkl_recording(
         raise errors[0]
 
 
+@with_rerun_cleanup
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
@@ -616,6 +617,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
                         policy_sync_executor=policy_sync_executor,
                         remote_policy_client=None,
                         intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,

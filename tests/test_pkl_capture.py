@@ -3,7 +3,6 @@ import importlib.util
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -152,14 +151,13 @@ class CaptureTests(unittest.TestCase):
         output = self.root / "converted"
         output.mkdir()
         (output / "conversion.complete.json").write_text(json.dumps({"episodes": 1, "frames": 3}))
+        import resumable_upload
         with (patch.object(converter, "verify_output"),
-              patch.object(converter.subprocess, "run", return_value=
-                           subprocess.CompletedProcess([], 0, stdout='{"status":"ready"}', stderr="")) as run,
-              patch.object(converter, "send_directory", side_effect=subprocess.CalledProcessError(1, ["ssh"])) as transfer):
-            with self.assertRaises(subprocess.CalledProcessError):
+              patch.object(resumable_upload, "resumable_upload", side_effect=RuntimeError("simulated connection lost")) as transfer):
+            with self.assertRaisesRegex(RuntimeError, "connection lost"):
                 converter.upload(output, "example.invalid", "test", "/data/datasets")
-            self.assertEqual(run.call_count, 1)  # only prepare, no publication after transfer failure
             transfer.assert_called_once()
+            self.assertTrue((output / "conversion.complete.json").is_file())
         raw = self.completed()
         (self.root / "upload.json").write_text(json.dumps({
             "upload_host": "example.invalid", "upload_user": "test", "upload_dir": "/data/datasets",
@@ -217,11 +215,11 @@ class CaptureTests(unittest.TestCase):
         marker = json.loads((output / "conversion.complete.json").read_text())
         self.assertEqual(marker["frames"], 6)
         self.assertEqual(marker["episodes"], 2)
-        self.assertEqual(len(list((output / "videos").rglob("*.mp4"))), 3)
+        self.assertEqual(len(list((output / "videos").rglob("*.mp4"))), 6)
         self.assertTrue(list((output / "data").rglob("*.parquet")))
         import pyarrow.parquet as pq
-        table = pq.read_table(next((output / "data").rglob("*.parquet")))
-        rows = table.to_pylist()
+        rows = [row for path in sorted((output / "data").rglob("*.parquet"))
+                for row in pq.ParquetFile(path).read().to_pylist()]
         self.assertEqual([row["observation.state"][0] for row in rows], list(range(6)))
         self.assertEqual([row["action"][0] for row in rows], list(range(1, 7)))
         self.assertEqual([row["complementary_info.collector_policy_id"] for row in rows], ["human"] * 6)

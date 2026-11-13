@@ -57,8 +57,6 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
-import rerun as rr
-
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
@@ -108,8 +106,7 @@ from lerobot.utils.control_utils import sanity_check_bimanual_piper_pair
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, with_rerun_cleanup
 
 LOOP_STATUS_INTERVAL_S = 0.5
 
@@ -129,7 +126,7 @@ class TeleoperateConfig:
     # Port of the remote Rerun server
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
-    display_compressed_images: bool = False
+    display_compressed_images: bool = True
 
 
 def _processor_pipeline_needs_observation(
@@ -168,7 +165,7 @@ def teleop_loop(
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
     display_data: bool = False,
     duration: float | None = None,
-    display_compressed_images: bool = False,
+    display_compressed_images: bool = True,
 ):
     """
     This function continuously reads actions from a teleoperation device, processes them through optional
@@ -225,13 +222,14 @@ def teleop_loop(
                 compress_images=display_compressed_images,
             )
 
-            print("\n" + "-" * (display_len + 10))
-            print(f"{'NAME':<{display_len}} | {'NORM':>7}")
-            for motor, value in robot_action_to_send.items():
-                print(f"{motor:<{display_len}} | {value:>7.2f}")
-            if sys.stdout.isatty():
-                move_cursor_up(len(robot_action_to_send) + 3)
-
+            # Bound console/IDE scrollback as well as image history.
+            if time.monotonic() - last_loop_status_t >= LOOP_STATUS_INTERVAL_S:
+                print("\n" + "-" * (display_len + 10))
+                print(f"{'NAME':<{display_len}} | {'NORM':>7}")
+                for motor, value in robot_action_to_send.items():
+                    print(f"{motor:<{display_len}} | {value:>7.2f}")
+                if sys.stdout.isatty():
+                    move_cursor_up(len(robot_action_to_send) + 3)
         dt_s = time.perf_counter() - loop_start
         precise_sleep(max(1 / fps - dt_s, 0.0))
         loop_s = time.perf_counter() - loop_start
@@ -246,6 +244,7 @@ def teleop_loop(
             return
 
 
+@with_rerun_cleanup
 @parser.wrap()
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
@@ -285,8 +284,6 @@ def teleoperate(cfg: TeleoperateConfig):
     except KeyboardInterrupt:
         pass
     finally:
-        if cfg.display_data:
-            rr.rerun_shutdown()
         teleop.disconnect()
         robot.disconnect()
 

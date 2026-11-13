@@ -1,7 +1,6 @@
 """Converter backpressure and upload publication tests; no SSH/SCP execution."""
 import importlib.util
 import json
-import shlex
 import shutil
 import subprocess
 import sys
@@ -41,55 +40,36 @@ class ConverterTests(unittest.TestCase):
             input=json.dumps(manifest), text=True, capture_output=True, check=check,
         )
 
-    def test_conversion_drains_image_queue_every_thirty_samples(self):
-        raw = self.root / "raw"
-        output = self.root / "converted"
-        pending = 0
-        peak = 0
-        drains = []
-        count = 0
+    def test_conversion_commits_bounded_frame_groups(self):
+        import pickle
+        import zlib
 
-        class FakeDataset:
-            features = {}
+        import numpy as np
 
-            def add_frame(self, frame):
-                nonlocal pending, peak, count
-                pending += 1
-                count += 1
-                peak = max(peak, pending)
-
-            def _wait_image_writer(self):
-                nonlocal pending
-                drains.append(count)
-                pending = 0
-
-            def save_episode(self, **kwargs):
-                self._wait_image_writer()
-
-            def stop_image_writer(self):
-                pass
-
-            def finalize(self):
-                pass
-
-        dataset = FakeDataset()
-
-        def create(**kwargs):
-            kwargs["root"].mkdir()
-            return dataset
-
-        FakeDataset.create = staticmethod(create)
-        fake_module = SimpleNamespace(LeRobotDataset=FakeDataset)
-        info = {"repo_id": "local/test", "fps": 30, "features": {}, "robot_type": "synthetic", "vcodec": "h264"}
-        episodes = [(raw / "episode", {"episode_index": 0, "frames": 61, "metadata": {}})]
-        with patch.dict(sys.modules, {"lerobot.datasets.lerobot_dataset": fake_module}), \
-                patch.object(converter, "capture_info", return_value=(raw, info, episodes)), \
-                patch.object(converter, "validate_capture", return_value=61), \
-                patch.object(converter, "episode_records", return_value=iter({"frame": {}} for _ in range(61))), \
-                patch.object(converter, "verify_output"):
-            converter.convert(raw, output)
-        self.assertEqual(drains, [30, 60, 61])
-        self.assertEqual(peak, 30)
+        from lerobot.datasets.pkl_dataset import MAGIC, RECORD_HEADER
+        from resumable_conversion import prepare_episode
+        folder = self.root / "raw-episode"
+        folder.mkdir()
+        with (folder / "part-000000.pkl").open("wb") as stream:
+            stream.write(MAGIC)
+            for index in range(61):
+                packet = {"frame_index": index, "timestamp": index / 30,
+                          "frame": {"state": np.array([index], dtype=np.float32), "task": "bounded"}}
+                body = pickle.dumps(packet, protocol=5)
+                stream.write(RECORD_HEADER.pack(len(body), zlib.crc32(body)))
+                stream.write(body)
+        descriptor = {"episode_index": 0, "frames": 61, "shards": ["part-000000.pkl"]}
+        info = {"fps": 30, "features": {"state": {"dtype": "float32", "shape": (1,)}}}
+        api = SimpleNamespace(DEFAULT_FIELDS=set())
+        updates = []
+        chunks = prepare_episode(folder, descriptor, info, self.root / "episode", "source-id", 30,
+                                 api, SimpleNamespace(update=updates.append))
+        self.assertEqual([marker["frames"] for _, marker in chunks], [30, 30, 1])
+        self.assertEqual([marker["start"] for _, marker in chunks], [0, 30, 60])
+        self.assertEqual(sum(updates), 61)
+        for path, marker in chunks:
+            with (path / "frames.pkl").open("rb") as stream:
+                self.assertEqual(len(pickle.load(stream)), marker["frames"])
 
     def test_remote_publish_and_retry_verify_fresh_manifest_under_optimization(self):
         local, manifest = self.output()
@@ -126,37 +106,27 @@ class ConverterTests(unittest.TestCase):
         self.assertFalse(final.exists())
         self.assertTrue(temporary.exists())
 
-    def test_completed_upload_retry_skips_scp(self):
+    def test_upload_backend_preserves_idempotent_completion_result(self):
+        import resumable_upload
         local, _ = self.output()
-        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps({
-            "status": "already_complete", "path": "/remote",
-        }), stderr="")
-        with patch.object(converter, "verify_output"), patch.object(converter.subprocess, "run", return_value=completed) as run:
-            converter.upload(local, "example.invalid", "test", "/remote")
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][0], "ssh")
-        self.assertEqual(json.loads(run.call_args.kwargs["input"]), converter.checksum_manifest(local))
-        remote_arguments = shlex.split(run.call_args.args[0][-1])
-        self.assertEqual(remote_arguments[-1], "/remote")
-        self.assertEqual(remote_arguments[-3], "/")
+        completed = {"status": "already_complete", "path": "/remote"}
+        with (patch.object(converter, "verify_output") as verify,
+              patch.object(resumable_upload, "resumable_upload", return_value=completed) as backend):
+            result = converter.upload(local, "example.invalid", "test", "/remote")
+        self.assertEqual(result, completed)
+        verify.assert_called_once_with(local, 1, 61)
+        self.assertEqual(backend.call_args.args[:5], (local, "example.invalid", "test", "/remote", 22))
 
-    def test_upload_uses_exact_target_without_local_directory_name(self):
+    def test_upload_passes_exact_target_without_local_directory_name(self):
+        import resumable_upload
         local, _ = self.output()
-        prepared = subprocess.CompletedProcess([], 0, stdout='{"status":"ready"}', stderr="")
-        published = subprocess.CompletedProcess([], 0, stdout='{"status":"complete","path":"/remote/test"}', stderr="")
         with (patch.object(converter, "verify_output"),
-              patch.object(converter.subprocess, "run", side_effect=[prepared, published]) as run,
-              patch.object(converter, "send_directory") as send):
+              patch.object(resumable_upload, "resumable_upload") as backend):
             converter.upload(local, "example.invalid", "test", "/remote/test/", 2222)
-        prepare_arguments = shlex.split(run.call_args_list[0].args[0][-1])
-        publish_arguments = shlex.split(run.call_args_list[1].args[0][-1])
-        self.assertEqual(prepare_arguments[-3], "/remote")
-        self.assertEqual(prepare_arguments[-1], "/remote/test")
-        self.assertTrue(prepare_arguments[-2].startswith("/remote/test.uploading-"))
-        self.assertEqual(publish_arguments[-1], "/remote/test")
-        self.assertNotIn("local-dataset", prepare_arguments[-1])
-        transfer_arguments = shlex.split(send.call_args.args[0][-1])
-        self.assertEqual(transfer_arguments[-1], prepare_arguments[-2])
+        self.assertEqual(backend.call_args.args[:5],
+                         (local, "example.invalid", "test", "/remote/test/", 2222))
+        self.assertNotIn("local-dataset", backend.call_args.args[3])
+        self.assertEqual(backend.call_args.args[5], ["-o", "BatchMode=yes"])
 
     def test_existing_empty_target_is_published_in_place(self):
         local, manifest = self.output()

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import numbers
 import os
 
@@ -42,6 +43,23 @@ def init_rerun(
         rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
     else:
         rr.spawn(memory_limit=memory_limit)
+
+
+def with_rerun_cleanup(func):
+    """
+    Decorator that shuts down the Rerun SDK when the wrapped function exits,
+    including on exceptions such as KeyboardInterrupt, so the spawned viewer
+    process doesn't linger.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        finally:
+            rr.rerun_shutdown()
+
+    return wrapper
 
 
 def _is_scalar(x):

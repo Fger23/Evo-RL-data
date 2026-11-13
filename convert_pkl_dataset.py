@@ -12,20 +12,18 @@ import math
 import os
 import pickle
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
 import threading
-import uuid
 from collections import defaultdict
 from contextlib import contextmanager, suppress
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-from lerobot.datasets.pkl_dataset import atomic_json, decode_png_rgb, iter_records
+from lerobot.datasets.pkl_dataset import decode_png_rgb, iter_records
 
 DEFAULT_FIELDS = {"index", "frame_index", "timestamp", "episode_index", "task_index"}
 OFFLINE_WRITE_CHUNK_FRAMES = 30
@@ -322,95 +320,17 @@ def verify_output(output, expected_episodes, expected_frames):
                 raise ValueError(f"Video FPS mismatch: {path}")
 
 
-def convert(source, output):
-    import numpy as np
-    root, info, episodes = capture_info(source)
-    print("Checking PKL records/CRCs, frame order, shape, dtype and timestamps...", flush=True)
-    total = validate_capture(info, episodes)
-    output = Path(output).resolve()
-    if output == root or root in output.parents or output in root.parents:
-        raise ValueError("Output and raw capture must be separate, non-nested directories")
-    staging = output.with_name(output.name + ".converting")
-    if output.exists() or staging.exists():
-        raise FileExistsError(f"Use a new output path; refusing to overwrite {output} or {staging}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+def convert(source, output, *, checkpoint_frames=300):
+    """Resume committed frame/video transactions automatically."""
+    from types import SimpleNamespace
 
-    class PngReplayDataset(LeRobotDataset):
-        """Use original metadata/video logic while writing existing PNG bytes."""
-
-        def add_frame(self, frame):
-            decoded = dict(frame)
-            self._encoded_images = {}
-            try:
-                for key, feature in self.features.items():
-                    if feature["dtype"] in {"image", "video"}:
-                        image = decode_png_rgb(frame[key], feature["shape"])
-                        decoded[key] = image
-                        self._encoded_images[id(image)] = frame[key]
-                super().add_frame(decoded)
-            finally:
-                self._encoded_images = {}
-
-        def _save_image(self, image, fpath, compress_level=1):
-            encoded = self._encoded_images.get(id(image))
-            if encoded is None:
-                return super()._save_image(image, fpath, compress_level)
-            # Reuse capture PNG bytes exactly; no second PNG encode.
-            Path(fpath).write_bytes(encoded)
-
-    png_capture = info.get("image_encoding", "raw") == "png"
-    dataset_class = PngReplayDataset if png_capture else LeRobotDataset
-    dataset = dataset_class.create(
-        repo_id=info["repo_id"], fps=info["fps"], features=info["features"],
-        root=staging, robot_type=info["robot_type"], use_videos=True,
-        image_writer_threads=0 if png_capture else 4, image_writer_processes=0,
-        batch_encoding_size=1, vcodec=info["vcodec"],
+    from resumable_conversion import convert_resumable
+    api = SimpleNamespace(
+        capture_info=capture_info, episode_records=episode_records,
+        decode_png_rgb=decode_png_rgb, DEFAULT_FIELDS=DEFAULT_FIELDS,
+        verify_output=verify_output, progress_bar=progress_bar,
     )
-    frames_bar = progress_bar(total=total, desc="Frames prepared", unit="frame", position=0)
-    episodes_bar = progress_bar(total=len(episodes), desc="Episodes encoded", unit="episode", position=1)
-    try:
-        for folder, descriptor in episodes:
-            frames_bar.set_postfix_str(f"episode {descriptor['episode_index'] + 1}/{len(episodes)}", refresh=False)
-            for frame_count, packet in enumerate(episode_records(folder, descriptor), start=1):
-                # Original add_frame validates keys before generating timestamp.
-                # Keep timestamp out of frame; original code regenerates n/fps.
-                dataset.add_frame(packet["frame"])
-                frames_bar.update(1)
-                if frame_count % OFFLINE_WRITE_CHUNK_FRAMES == 0:
-                    # Original AsyncImageWriter has an unbounded queue. Drain
-                    # regularly so a fast raw reader cannot queue a whole
-                    # multi-GB episode while PNG writes lag behind.
-                    dataset._wait_image_writer()
-            # This checkout maps shape=(1,) to an Arrow scalar. NumPy 2.4+
-            # rejects float(array([x])); preserve dtype/value as numpy scalars.
-            for key, feature in dataset.features.items():
-                if (key not in DEFAULT_FIELDS and tuple(feature["shape"]) == (1,)
-                        and feature["dtype"] not in ("string", "image", "video")):
-                    dataset.episode_buffer[key] = [
-                        np.asarray(value).reshape(())[()] for value in dataset.episode_buffer[key]
-                    ]
-            episodes_bar.set_postfix_str(f"encoding episode {descriptor['episode_index'] + 1}")
-            with refresh_progress(episodes_bar):
-                dataset.save_episode(extra_episode_metadata=descriptor["metadata"])
-            episodes_bar.update(1)
-            episodes_bar.set_postfix_str("episode complete")
-            tqdm.write(f"Converted episode {descriptor['episode_index'] + 1}/{len(episodes)}")
-    finally:
-        frames_bar.close()
-        episodes_bar.close()
-        try:
-            dataset.stop_image_writer()
-        finally:
-            dataset.finalize()
-    print("Verifying converted dataset...", flush=True)
-    verify_output(staging, len(episodes), total)
-    atomic_json(staging / "conversion.complete.json", {
-        "episodes": len(episodes), "frames": total, "fps": info["fps"],
-    })
-    staging.rename(output)
-    print(f"Conversion verified: {output}", flush=True)
-    return output
+    return convert_resumable(source, output, api=api, chunk_frames=checkpoint_frames)
 
 
 def checksum_manifest(output):
@@ -468,55 +388,17 @@ def upload(output, host, user, remote_directory, port=22, password=None):
 
 
 def _upload_dataset(output, host, user, remote_directory, port, ssh_options, environment):
-    output = Path(output).resolve()
-    marker = json.loads((output / "conversion.complete.json").read_text(encoding="utf-8"))
-    verify_output(output, marker["episodes"], marker["frames"])
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or host.startswith("-"):
-        raise ValueError("Upload host must be an IPv4 address or DNS hostname")
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", user):
-        raise ValueError("Invalid SSH username")
-    # Keep remote paths portable and easy to reuse in shell commands.
-    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", remote_directory) or ".." in remote_directory.split("/"):
-        raise ValueError("Use an absolute remote directory with ASCII letters/digits, /, _, ., -")
-    final = PurePosixPath(remote_directory).as_posix()
-    if not PurePosixPath(final).name:
-        raise ValueError("Upload destination must be a dataset directory, not filesystem root")
-    remote_parent = PurePosixPath(final).parent.as_posix()
-    if not 1 <= port <= 65535:
-        raise ValueError("Invalid SSH port")
-    manifest = checksum_manifest(output)
-    target = f"{user}@{host}"
-    temporary = final + ".uploading-" + uuid.uuid4().hex[:12]
-
-    def ssh_python(code, *arguments):
-        command = shlex.join(["python3", "-c", code, *arguments])
-        try:
-            result = subprocess.run(
-                ["ssh", *ssh_options, "-p", str(port), target, command],
-                input=json.dumps(manifest, ensure_ascii=True),
-                text=True, capture_output=True, check=True, env=environment,
-            )
-        except subprocess.CalledProcessError as error:
-            detail = error.stderr.strip() if error.stderr else f"SSH exited with status {error.returncode}"
-            raise RuntimeError(f"Remote upload step failed: {detail}") from error
-        return json.loads(result.stdout)
-
-    preparation = ssh_python(
-        REMOTE_PREPARE_SCRIPT,
-        remote_parent, temporary, final,
-    )
-    if preparation.get("status") == "already_complete":
-        print(f"Upload already verified: {preparation['path']}", flush=True)
-        return
-    if preparation.get("status") != "ready":
-        raise ValueError("Unexpected remote upload preparation response")
-    receive_command = shlex.join(["python3", "-c", REMOTE_RECEIVE_SCRIPT, temporary])
-    send_directory(["ssh", *ssh_options, "-p", str(port), target, receive_command], output, env=environment)
-    print("Verifying remote SHA256 before publishing...", flush=True)
-    publication = ssh_python(REMOTE_PUBLISH_SCRIPT, temporary, final)
-    if publication.get("status") not in {"complete", "already_complete"}:
-        raise ValueError("Unexpected remote upload publication response")
-    print(f"Upload verified: {publication['path']}", flush=True)
+    from resumable_upload import resumable_upload
+    from resume_common import dataset_lock, reject_symlinks, verify_manifest
+    output = reject_symlinks(output)
+    with dataset_lock(output):
+        marker = json.loads((output / "conversion.complete.json").read_text(encoding="utf-8"))
+        verify_output(output, marker["episodes"], marker["frames"])
+        if marker.get("files") is not None and not verify_manifest(
+                output, marker["files"], exclude=("conversion.complete.json", "upload.sha256.json")):
+            raise ValueError("Dataset SHA256 mismatch; refusing to upload modified conversion output")
+        return resumable_upload(output, host, user, remote_directory, port,
+                                ssh_options, environment, progress_factory=progress_bar)
 
 
 def parse_upload_target(target):
@@ -534,7 +416,9 @@ def main():
     global PROGRESS_ENABLED
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", help="Trusted capture.pkl or capture directory")
-    parser.add_argument("--output", type=Path, help="New dataset directory; defaults to <capture>-dataset")
+    parser.add_argument("--output", type=Path, help="Dataset directory; same command automatically resumes <output>.resume")
+    parser.add_argument("--checkpoint-frames", type=int, default=300,
+                        help="Frames per durable conversion checkpoint (default: 300 = 10 seconds at 30 FPS)")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--upload-only", action="store_true", help="Retry upload of an already converted --output")
     default_config = Path(__file__).resolve().with_name("upload.json")
@@ -583,7 +467,7 @@ def main():
             print(f"PKL verified: {len(episodes)} episodes, {frames} frames, {info['fps']} FPS")
             return
         output = args.output or root.with_name(root.name + "-dataset")
-        output = convert(args.input, output)
+        output = convert(args.input, output, checkpoint_frames=args.checkpoint_frames)
     if host:
         password_env = args.upload_password_env or settings.get("upload_password_env")
         password = os.environ.get(password_env) if password_env else settings.get("upload_password")
@@ -596,4 +480,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Checkpoints are preserved; rerun the same command to resume.", file=sys.stderr)
+        raise SystemExit(130) from None

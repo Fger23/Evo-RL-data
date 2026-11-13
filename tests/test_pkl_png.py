@@ -116,7 +116,8 @@ class PngCaptureTests(unittest.TestCase):
         original_save = LeRobotDataset.save_episode
 
         def serial_save(dataset, *args, **kwargs):
-            return original_save(dataset, *args, parallel_encoding=False, **kwargs)
+            kwargs["parallel_encoding"] = False
+            return original_save(dataset, *args, **kwargs)
 
         output = self.root / "converted"
         with (patch.object(LeRobotDataset, "save_episode", serial_save),
@@ -125,7 +126,7 @@ class PngCaptureTests(unittest.TestCase):
         marker = json.loads((output / "conversion.complete.json").read_text())
         self.assertEqual(marker["frames"], 4)
         self.assertEqual(marker["episodes"], 2)
-        self.assertEqual(len(list((output / "videos").rglob("*.mp4"))), 3)
+        self.assertEqual(len(list((output / "videos").rglob("*.mp4"))), 6)
 
 
 if __name__ == "__main__":

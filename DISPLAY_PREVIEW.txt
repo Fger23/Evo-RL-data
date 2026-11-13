@@ -1,0 +1,42 @@
+实时显示与内存（108 修复版）
+
+继续使用原命令的 --display_data=true。此开关仅开启预览，不改变采集的 RGB、
+PNG/PKL 编码、机械臂动作和 dataset.fps。正确拼写是 display_data。
+
+本地/远程预览默认开启 display_compressed_images=true（预览 JPEG 质量 80）。
+采集保存的图片仍按原配置处理；预览的 JPEG 不会写入采集 PKL。
+明确设置 --display_compressed_images=false 可保留未压缩预览，但带宽会明显增大。
+
+显示慢、窗口关闭、远程显示端断开时，只丢弃预览帧，不阻塞机械臂或录制：
+  - 主进程固定 16 MiB 的单帧邮箱，只保存最新一帧，没有历史队列/后台 feeder。
+  - 独立进程负责 JPEG、Rerun 序列化和 gRPC；每批发送确认后才读取下一帧。
+  - 初始化连接、flush、原生 SDK 卡死或内存超预算时，停止预览并打印一次原因。
+    此时控制/录制继续；下一次启动命令会重新开启预览。
+  - 命令退出时清理自己创建的 worker/viewer；不关闭用户已有的其他 viewer。
+    自有 viewer 使用独立端口，避免复用旧窗口而使内存参数不生效。
+  - Linux 下父进程被强杀时，worker 会检查父 PID 并清理自己的 viewer。
+  - 遥操终端关节表最多每 0.5 秒刷新一次，避免输出历史堆积。
+
+默认资源设置（均为预览设置）：
+  LEROBOT_DISPLAY_FPS=30                 预览最高刷新率，慢时自动丢帧
+  LEROBOT_DISPLAY_MAX_FRAME_MB=16        固定邮箱容量，过大的单帧不会排队
+  LEROBOT_DISPLAY_JPEG_QUALITY=80
+  LEROBOT_RERUN_MEMORY_LIMIT=512MiB      自有 viewer 的历史数据预算
+  LEROBOT_RERUN_SERVER_MEMORY_LIMIT=32MiB 自有 viewer 的 gRPC 历史缓冲
+  LEROBOT_DISPLAY_WORKER_MEMORY_MB=512   Linux worker RSS 超限时终止预览
+  LEROBOT_DISPLAY_VIEWER_MEMORY_MB=2048  Linux 自有 viewer 进程组 RSS 超限时终止预览
+  LEROBOT_DISPLAY_FLUSH_TIMEOUT_S=0.5
+  LEROBOT_DISPLAY_STARTUP_TIMEOUT_S=15
+
+显式 --display_ip/--display_port 连接的是用户管理的远程 viewer；本进程只能约束
+自己的 SDK/预览进程，远程 viewer 的内存预算须在那台机器启动 viewer 时设置。
+本机预览资源检查不包含机械臂策略模型、采集队列等录制本身的正常内存。
+
+原因与注意：
+  Rerun 0.26.2 的客户端发送队列没有容量上限。只限制 viewer 的历史数据无法限制
+  这个队列；仅将 rr.log 放进 Python 的 maxsize=1 队列也无法限制底层 SDK。
+  Rerun 默认 static=False，已有自动时间轴；补 frame/time 不会修复发送积压。
+  server_memory_limit=0B 表示不为后连接的客户端保存历史，不是无限缓存。
+
+无硬件测试：
+  python -m pytest tests/test_live_preview.py tests/utils/test_visualization_utils.py -q
