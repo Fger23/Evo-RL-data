@@ -51,6 +51,7 @@ from lerobot.processor import RobotAction
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_piper_follower,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,

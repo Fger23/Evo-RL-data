@@ -1,0 +1,18 @@
+{
+  "session_dir": "piper_vla_logs/session_20261109_160319_584505_522475",
+  "start_wall": "2026-11-09T16:03:19.584583+08:00",
+  "end_wall": "2026-11-09T16:08:33.119917+08:00",
+  "feedback_hz_requested": 100.0,
+  "feedback_errors": {
+    "right": 0,
+    "left": 0
+  },
+  "dropped_log_records": {
+    "inference": 0,
+    "commands": 0,
+    "feedback": 0,
+    "events": 0
+  },
+  "writer_error": null,
+  "mode_note": "async_inference client | policy=pi05 | model=/nfs/lerobot/piper/models/evo/policy/TakeCard1104_pi05/checkpoints/last/pretrained_model | actions_per_chunk=50 | server=10.61.5.1:8099"
+}

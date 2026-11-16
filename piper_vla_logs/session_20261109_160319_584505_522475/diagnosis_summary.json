@@ -1,0 +1,445 @@
+{
+  "notes": [
+    "This is statistical correlation, not a proven root cause.",
+    "q_sent is the host-requested target; it does not mean the driver executed or accepted it.",
+    "Feedback sampling and command sending are not hardware-synchronized; do not subtract same-index q_sent and q_actual as tracking error.",
+    "High-frequency vibration may be above the observable range of the feedback sampling rate."
+  ],
+  "n_vla_chunks": 273,
+  "n_commands": 6202,
+  "n_feedback_samples": 61876,
+  "inference_ms": {
+    "count": 273,
+    "mean": 865.5214,
+    "median": 817.8188,
+    "p95": 1201.6077,
+    "p99": 1503.5879,
+    "max": 3027.2822,
+    "min": 421.2065
+  },
+  "dropped_log_records": {
+    "inference": 0,
+    "commands": 0,
+    "feedback": 0,
+    "events": 0
+  },
+  "mode_note": "async_inference client | policy=pi05 | model=/nfs/lerobot/piper/models/evo/policy/TakeCard1104_pi05/checkpoints/last/pretrained_model | actions_per_chunk=50 | server=10.61.5.1:8099",
+  "arms": {
+    "left": {
+      "n_commands": 3101,
+      "send_dt_ms": {
+        "count": 3100,
+        "mean": 73.2051,
+        "median": 32.8107,
+        "p95": 364.2875,
+        "p99": 514.4954,
+        "max": 1990.9086,
+        "min": 27.265
+      },
+      "sdk_call_ms": {
+        "count": 3101,
+        "mean": 0.6159,
+        "median": 0.4607,
+        "p95": 1.5235,
+        "p99": 2.6753,
+        "max": 6.2281,
+        "min": 0.1159
+      },
+      "queue_size": {
+        "count": 3101,
+        "mean": 34.4898,
+        "median": 35.0,
+        "p95": 45.0,
+        "p99": 46.0,
+        "max": 49.0,
+        "min": 0.0
+      },
+      "joint_metrics": {
+        "J1": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.143,
+            "median": 0.0251,
+            "p95": 1.0838,
+            "p99": 1.6019,
+            "max": 4.2669,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 2.3956,
+            "median": 1.0442,
+            "p95": 6.0978,
+            "p99": 32.9956,
+            "max": 149.1567,
+            "min": 0.0001
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0099,
+            "median": 0.0037,
+            "p95": 0.0469,
+            "p99": 0.1004,
+            "max": 0.146,
+            "min": 0.0001
+          }
+        },
+        "J2": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.2298,
+            "median": 0.0385,
+            "p95": 1.1421,
+            "p99": 1.4764,
+            "max": 4.006,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 2.887,
+            "median": 1.2789,
+            "p95": 8.0046,
+            "p99": 36.8963,
+            "max": 115.3806,
+            "min": 0.0001
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.015,
+            "median": 0.0047,
+            "p95": 0.0703,
+            "p99": 0.1146,
+            "max": 0.1353,
+            "min": 0.0
+          }
+        },
+        "J3": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.114,
+            "median": 0.0221,
+            "p95": 0.6075,
+            "p99": 0.943,
+            "max": 2.1809,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 1.6511,
+            "median": 0.709,
+            "p95": 4.656,
+            "p99": 23.7447,
+            "max": 86.3827,
+            "min": 0.0
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.008,
+            "median": 0.0029,
+            "p95": 0.0346,
+            "p99": 0.0612,
+            "max": 0.0726,
+            "min": 0.0
+          }
+        },
+        "J4": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.2467,
+            "median": 0.0628,
+            "p95": 1.1401,
+            "p99": 1.6855,
+            "max": 6.3819,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 3.9989,
+            "median": 1.5741,
+            "p95": 12.3971,
+            "p99": 46.1415,
+            "max": 190.5431,
+            "min": 0.0005
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0213,
+            "median": 0.0088,
+            "p95": 0.077,
+            "p99": 0.1771,
+            "max": 0.2148,
+            "min": 0.0
+          }
+        },
+        "J5": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.3369,
+            "median": 0.0985,
+            "p95": 1.3441,
+            "p99": 3.1826,
+            "max": 6.9907,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 5.0436,
+            "median": 2.1068,
+            "p95": 17.1579,
+            "p99": 56.7956,
+            "max": 213.5096,
+            "min": 0.0002
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0269,
+            "median": 0.0131,
+            "p95": 0.0946,
+            "p99": 0.2093,
+            "max": 0.2353,
+            "min": 0.0001
+          }
+        },
+        "J6": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.2939,
+            "median": 0.0958,
+            "p95": 1.2594,
+            "p99": 1.8639,
+            "max": 6.7746,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 5.2486,
+            "median": 2.4636,
+            "p95": 15.9781,
+            "p99": 51.225,
+            "max": 211.3481,
+            "min": 0.0009
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0249,
+            "median": 0.0109,
+            "p95": 0.1136,
+            "p99": 0.1917,
+            "max": 0.2217,
+            "min": 0.0
+          }
+        }
+      },
+      "send_dt_over_1_5x_median_count": 372,
+      "send_dt_under_0_5x_median_count": 0
+    },
+    "right": {
+      "n_commands": 3101,
+      "send_dt_ms": {
+        "count": 3101,
+        "mean": 0.8659,
+        "median": 0.6981,
+        "p95": 1.9237,
+        "p99": 3.3663,
+        "max": 7.6665,
+        "min": 0.2035
+      },
+      "sdk_call_ms": {
+        "count": 3101,
+        "mean": 0.4127,
+        "median": 0.2872,
+        "p95": 1.1373,
+        "p99": 2.0463,
+        "max": 4.2339,
+        "min": 0.0527
+      },
+      "queue_size": {
+        "count": 3101,
+        "mean": 34.4898,
+        "median": 35.0,
+        "p95": 45.0,
+        "p99": 46.0,
+        "max": 49.0,
+        "min": 0.0
+      },
+      "joint_metrics": {
+        "J1": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.1874,
+            "median": 0.0426,
+            "p95": 0.9195,
+            "p99": 1.2508,
+            "max": 3.7041,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 2.8839,
+            "median": 1.3456,
+            "p95": 8.5046,
+            "p99": 31.3068,
+            "max": 125.9068,
+            "min": 0.0001
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0126,
+            "median": 0.0063,
+            "p95": 0.0439,
+            "p99": 0.0631,
+            "max": 0.1056,
+            "min": 0.0001
+          }
+        },
+        "J2": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.1757,
+            "median": 0.0406,
+            "p95": 0.8398,
+            "p99": 1.352,
+            "max": 6.103,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 2.8875,
+            "median": 1.1753,
+            "p95": 7.663,
+            "p99": 44.0107,
+            "max": 150.1577,
+            "min": 0.0
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0144,
+            "median": 0.0047,
+            "p95": 0.0637,
+            "p99": 0.1131,
+            "max": 0.2024,
+            "min": 0.0
+          }
+        },
+        "J3": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.1784,
+            "median": 0.0398,
+            "p95": 0.8467,
+            "p99": 1.521,
+            "max": 7.2335,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 2.9805,
+            "median": 1.2435,
+            "p95": 8.4262,
+            "p99": 35.0282,
+            "max": 224.9195,
+            "min": 0.0001
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0165,
+            "median": 0.0039,
+            "p95": 0.0638,
+            "p99": 0.1239,
+            "max": 0.2452,
+            "min": 0.0
+          }
+        },
+        "J4": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.2114,
+            "median": 0.0635,
+            "p95": 0.9152,
+            "p99": 1.5356,
+            "max": 11.8843,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 3.9996,
+            "median": 1.5861,
+            "p95": 12.4158,
+            "p99": 55.9089,
+            "max": 364.804,
+            "min": 0.0003
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0214,
+            "median": 0.0089,
+            "p95": 0.0774,
+            "p99": 0.1201,
+            "max": 0.4029,
+            "min": 0.0001
+          }
+        },
+        "J5": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.2616,
+            "median": 0.0703,
+            "p95": 1.2448,
+            "p99": 2.0939,
+            "max": 9.6631,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 3.842,
+            "median": 1.5616,
+            "p95": 13.1947,
+            "p99": 42.3365,
+            "max": 331.4573,
+            "min": 0.0001
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0202,
+            "median": 0.0087,
+            "p95": 0.0861,
+            "p99": 0.1347,
+            "max": 0.3276,
+            "min": 0.0
+          }
+        },
+        "J6": {
+          "target_abs_speed_rad_s": {
+            "count": 3100,
+            "mean": 0.0582,
+            "median": 0.0182,
+            "p95": 0.2805,
+            "p99": 0.6117,
+            "max": 2.5002,
+            "min": 0.0
+          },
+          "target_abs_accel_rad_s2": {
+            "count": 3099,
+            "mean": 1.607,
+            "median": 0.6423,
+            "p95": 5.1572,
+            "p99": 20.816,
+            "max": 83.6568,
+            "min": 0.0001
+          },
+          "chunk_boundary_abs_jump_rad": {
+            "count": 271,
+            "mean": 0.0081,
+            "median": 0.0035,
+            "p95": 0.0271,
+            "p99": 0.0719,
+            "max": 0.1108,
+            "min": 0.0
+          }
+        }
+      },
+      "send_dt_over_1_5x_median_count": 814,
+      "send_dt_under_0_5x_median_count": 424
+    }
+  }
+}
