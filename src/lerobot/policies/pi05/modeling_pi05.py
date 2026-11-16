@@ -18,6 +18,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -1015,12 +1016,8 @@ class PI05Policy(PreTrainedPolicy):
                     )
                 # Device index is valid, keep the specified device
 
-        # Initialize model without loading weights
-        # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
-
-        # Ensure model is on the correct device before loading weights
-        # This is important to avoid device mismatch errors when loading state dict
+        # Stage the model and checkpoint on CPU. Copying a full FP32 checkpoint to
+        # CUDA alongside a BF16 model can exceed VRAM even when inference fits.
         target_device = config.device if config.device is not None else "cpu"
         # Normalize device string: "cuda" -> "cuda:0"
         if target_device == "cuda" and torch.cuda.is_available():
@@ -1033,7 +1030,9 @@ class PI05Policy(PreTrainedPolicy):
                     f"CUDA device {device_idx} is not available. "
                     f"Available devices: 0-{torch.cuda.device_count() - 1}"
                 )
-        model.to(target_device)
+        loading_config = deepcopy(config)
+        loading_config.device = "cpu"
+        model = cls(loading_config, **kwargs)
 
         # Now manually load and remap the state dict
         try:
@@ -1046,22 +1045,20 @@ class PI05Policy(PreTrainedPolicy):
                 resolved_file = cached_file(
                     pretrained_name_or_path,
                     "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    use_auth_token=kwargs.get("use_auth_token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    revision=revision,
+                    local_files_only=local_files_only,
                 )
                 from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
+                original_state_dict = load_file(resolved_file, device="cpu")
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+                raise RuntimeError(f"Could not load PI05 checkpoint from {pretrained_name_or_path}") from e
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1083,13 +1080,8 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Ensure all tensors in state dict are on the correct device
-            device_obj = torch.device(target_device)
-            for key, value in remapped_state_dict.items():
-                if isinstance(value, torch.Tensor):
-                    remapped_state_dict[key] = value.to(device_obj)
-
-            # Load the remapped state dict into the model
+            # load_state_dict copies CPU weights into the model's configured
+            # parameter dtypes, preserving the selected FP32 layers in BF16 mode.
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
             if missing_keys:
@@ -1116,8 +1108,11 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not remap state dict keys: {e}")
+            raise RuntimeError(f"Failed to load PI05 pretrained weights from {pretrained_name_or_path}") from e
 
+        del original_state_dict, fixed_state_dict, remapped_state_dict
+        model.to(target_device)
+        model.config.device = config.device
         return model
 
     def _fix_pytorch_state_dict_keys(
