@@ -65,10 +65,10 @@ class CaptureTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def writer(self, name="raw"):
+    def writer(self, name="raw", fps=30):
         root = self.root / name
         root.mkdir()
-        meta = SimpleNamespace(root=root, repo_id="local/synthetic", features=features(), fps=30,
+        meta = SimpleNamespace(root=root, repo_id="local/synthetic", features=features(), fps=fps,
                                info={"robot_type": "synthetic"}, _close_writer=lambda: None)
         # Tiny shards force rollover in a small, fast test.
         return storage.PklDataset(meta, queue_frames=2, shard_mb=0.002, sync_seconds=0.05, image_encoding="raw")
@@ -80,6 +80,22 @@ class CaptureTests(unittest.TestCase):
         writer.save_episode(extra_episode_metadata={"episode_success": "success"})
         writer.finalize()
         return writer.root
+
+    def test_configured_fps_is_preserved_in_header_and_frame_timestamps(self):
+        for fps in (20, 25, 30):
+            with self.subTest(fps=fps):
+                writer = self.writer(name=f"raw-{fps}", fps=fps)
+                try:
+                    for index in range(3):
+                        writer.add_frame(frame(index))
+                    writer.save_episode(extra_episode_metadata={"episode_success": "success"})
+                finally:
+                    writer.finalize()
+                _, info, episodes = converter.capture_info(writer.root)
+                self.assertEqual(info["fps"], fps)
+                self.assertEqual(converter.validate_capture(info, episodes), 3)
+                rows = list(converter.episode_records(*episodes[0]))
+                self.assertEqual([row["timestamp"] for row in rows], [index / fps for index in range(3)])
 
     def test_snapshot_rollover_rerecord_and_metadata(self):
         writer = self.writer()
@@ -175,12 +191,19 @@ class CaptureTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("EVO_PKL_INTEGRATION") == "1", "requires original LeRobot environment")
     def test_original_writer_round_trip(self):
+        self._original_writer_round_trip(30)
+
+    @unittest.skipUnless(os.environ.get("EVO_PKL_INTEGRATION") == "1", "requires original LeRobot environment")
+    def test_original_writer_round_trip_at_25_fps(self):
+        self._original_writer_round_trip(25)
+
+    def _original_writer_round_trip(self, fps):
         # Slow test: uses the real PNG, video, Parquet and dataset metadata code.
         # No devices/network. Serial encoding makes the test portable on Windows.
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         writer = storage.PklDataset.create(
-            repo_id="local/synthetic", fps=30, features=features(),
+            repo_id="local/synthetic", fps=fps, features=features(),
             root=self.root / "raw-integration", robot_type="synthetic",
             queue_frames=2, shard_mb=1,
             image_encoding="raw",
@@ -215,6 +238,7 @@ class CaptureTests(unittest.TestCase):
         marker = json.loads((output / "conversion.complete.json").read_text())
         self.assertEqual(marker["frames"], 6)
         self.assertEqual(marker["episodes"], 2)
+        self.assertEqual(marker["fps"], fps)
         self.assertEqual(len(list((output / "videos").rglob("*.mp4"))), 6)
         self.assertTrue(list((output / "data").rglob("*.parquet")))
         import pyarrow.parquet as pq
@@ -223,7 +247,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual([row["observation.state"][0] for row in rows], list(range(6)))
         self.assertEqual([row["action"][0] for row in rows], list(range(1, 7)))
         self.assertEqual([row["complementary_info.collector_policy_id"] for row in rows], ["human"] * 6)
-        np.testing.assert_allclose([row["timestamp"] for row in rows], [0, 1/30, 2/30] * 2)
+        np.testing.assert_allclose([row["timestamp"] for row in rows], [0, 1/fps, 2/fps] * 2)
         # Decode actual video PTS at the episode boundary using the original
         # metadata offsets. PyAV works without torchvision's removed VideoReader.
         import av
@@ -231,6 +255,8 @@ class CaptureTests(unittest.TestCase):
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         restored = LeRobotDatasetMetadata("local/synthetic", root=output)
+        self.assertEqual(restored.fps, fps)
+        converter.verify_output(output, 2, 6, expected_fps=fps)
         for index in (2, 3):
             row = rows[index]
             self.assertEqual(row["frame_index"], index % 3)

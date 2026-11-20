@@ -41,8 +41,9 @@ class RTCProcessor:
     prefix attention, and adaptive chunk processing.
     """
 
-    def __init__(self, rtc_config: RTCConfig):
+    def __init__(self, rtc_config: RTCConfig, *, prefix_weights_device: torch.device | str | None = None):
         self.rtc_config = rtc_config
+        self.prefix_weights_device = prefix_weights_device
 
         self.tracker = None
 
@@ -251,10 +252,10 @@ class RTCProcessor:
         start = min(start, end)
 
         if self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.ZEROS:
-            weights = torch.zeros(total)
+            weights = torch.zeros(total, device=self.prefix_weights_device)
             weights[:start] = 1.0
         elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.ONES:
-            weights = torch.ones(total)
+            weights = torch.ones(total, device=self.prefix_weights_device)
             weights[end:] = 0.0
         elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR:
             lin_weights = self._linweights(start, end, total)
@@ -274,9 +275,9 @@ class RTCProcessor:
         linspace_steps = total - skip_steps_at_end - start
 
         if end <= start or linspace_steps <= 0:
-            return torch.tensor([])
+            return torch.tensor([], device=self.prefix_weights_device)
 
-        return torch.linspace(1, 0, linspace_steps + 2)[1:-1]
+        return torch.linspace(1, 0, linspace_steps + 2, device=self.prefix_weights_device)[1:-1]
 
     def _add_trailing_zeros(self, weights, total, end):
         zeros_len = total - end
@@ -284,7 +285,7 @@ class RTCProcessor:
         if zeros_len <= 0:
             return weights
 
-        zeros = torch.zeros(zeros_len)
+        zeros = torch.zeros(zeros_len, device=self.prefix_weights_device)
         return torch.cat([weights, zeros])
 
     def _add_leading_ones(self, weights, start, total):
@@ -293,5 +294,5 @@ class RTCProcessor:
         if ones_len <= 0:
             return weights
 
-        ones = torch.ones(ones_len)
+        ones = torch.ones(ones_len, device=self.prefix_weights_device)
         return torch.cat([ones, weights])

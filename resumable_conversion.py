@@ -495,7 +495,7 @@ def build_episode_package(chunks, videos, descriptor, info, package, fingerprint
     finally:
         dataset.stop_image_writer()
         dataset.finalize()
-    api.verify_output(temporary, 1, descriptor["frames"])
+    api.verify_output(temporary, 1, descriptor["frames"], expected_fps=info["fps"])
     marker = {"source_fingerprint": fingerprint, "episode_index": descriptor["episode_index"],
               "frames": descriptor["frames"], "files": file_manifest(temporary)}
     sync_tree(temporary)
@@ -527,9 +527,10 @@ def _complete_output(output, fingerprint, episodes, total, api, info):
     marker = json.loads(marker_path.read_text())
     if marker.get("source_fingerprint") not in (None, fingerprint):
         raise ValueError("Completed output belongs to another capture")
-    if marker.get("episodes") != len(episodes) or marker.get("frames") != total:
-        raise ValueError("Completed output counts differ from the source capture")
-    api.verify_output(output, len(episodes), total)
+    if (marker.get("episodes") != len(episodes) or marker.get("frames") != total
+            or marker.get("fps", 30) != info["fps"]):
+        raise ValueError("Completed output counts/FPS differ from the source capture")
+    api.verify_output(output, len(episodes), total, expected_fps=info["fps"])
     if marker.get("files") is not None and not verify_manifest(
             output, marker["files"], exclude=("conversion.complete.json", "upload.sha256.json")):
         raise ValueError("Completed dataset SHA256 mismatch; original data and checkpoints are preserved")
@@ -662,7 +663,7 @@ def convert_resumable(source, output, *, api, chunk_frames=DEFAULT_CHECKPOINT_FR
         assemble_episode_packages(packages, dataset_dir, info,
                                   checkpoint_dir=workspace / "assembly", progress_factory=api.progress_bar)
         print("Verifying complete native LeRobot dataset...", flush=True)
-        api.verify_output(dataset_dir, len(episodes), total)
+        api.verify_output(dataset_dir, len(episodes), total, expected_fps=info["fps"])
         # Recheck immutable source signatures before publishing, including any
         # replacement performed while this process was reading a source shard.
         if capture_identity(root, episodes)[0] != fingerprint:

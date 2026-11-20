@@ -114,7 +114,7 @@ class ConverterTests(unittest.TestCase):
               patch.object(resumable_upload, "resumable_upload", return_value=completed) as backend):
             result = converter.upload(local, "example.invalid", "test", "/remote")
         self.assertEqual(result, completed)
-        verify.assert_called_once_with(local, 1, 61)
+        verify.assert_called_once_with(local, 1, 61, expected_fps=30)
         self.assertEqual(backend.call_args.args[:5], (local, "example.invalid", "test", "/remote", 22))
 
     def test_upload_passes_exact_target_without_local_directory_name(self):
@@ -127,6 +127,18 @@ class ConverterTests(unittest.TestCase):
                          (local, "example.invalid", "test", "/remote/test/", 2222))
         self.assertNotIn("local-dataset", backend.call_args.args[3])
         self.assertEqual(backend.call_args.args[5], ["-o", "BatchMode=yes"])
+
+    def test_upload_validates_the_recorded_fps(self):
+        import resumable_upload
+
+        local, _ = self.output()
+        (local / "conversion.complete.json").write_text(json.dumps({
+            "episodes": 1, "frames": 61, "fps": 25,
+        }))
+        with (patch.object(converter, "verify_output") as verify,
+              patch.object(resumable_upload, "resumable_upload")):
+            converter.upload(local, "example.invalid", "test", "/remote/test")
+        verify.assert_called_once_with(local, 1, 61, expected_fps=25)
 
     def test_existing_empty_target_is_published_in_place(self):
         local, manifest = self.output()

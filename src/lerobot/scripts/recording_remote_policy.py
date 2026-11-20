@@ -14,23 +14,30 @@
 
 """Remote policy client used by recording loops.
 
-This adapter talks to ``lerobot.async_inference.policy_server`` but leaves robot
-control and dataset writing inside ``recording_loop.py`` so human-in-loop
-takeover semantics stay in one place.
+The default adapter talks to ``lerobot.async_inference.policy_server``. The RTC
+backend uses ``inference_time_rtc.recording_client``. Robot control and dataset
+writing remain inside ``recording_loop.py``.
 """
-import threading
+
 import logging
 import pickle  # nosec
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import grpc
 import torch
+
+from lerobot.inference_time_rtc.action_filter import ACTION_SG_WINDOWS
+from lerobot.inference_time_rtc.configs import (
+    SUPPORTED_POLICIES,
+    InferenceTimeRTCConfig,
+    RTCRecoveryConfig,
+    normalize_policy_device,
+    positive_finite,
+)
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import grpc_channel_options
-
-import grpc
-
 
 if TYPE_CHECKING:
     from lerobot.async_inference.helpers import TimedAction
@@ -50,7 +57,7 @@ AGGREGATE_FUNCTIONS = {
 
 @dataclass
 class RemotePolicyRecordConfig:
-    """Configuration for using a remote async policy while recording."""
+    """Configuration for a remote policy used by the recording loop."""
 
     enable: bool = False
     server_address: str = "localhost:8080"
@@ -63,10 +70,19 @@ class RemotePolicyRecordConfig:
     aggregate_fn_name: str = "weighted_average"
     obs_queue_timeout_s: float = 2.0
     rename_map: dict[str, str] = field(default_factory=dict)
+    backend: str = "async"
+    rtc: InferenceTimeRTCConfig = field(default_factory=InferenceTimeRTCConfig)
+    connect_timeout_s: float = 10.0
+    rpc_timeout_s: float = 120.0
+    allow_late_splice: bool = False
+    action_sg_window: int = 0
+    recovery: RTCRecoveryConfig = field(default_factory=RTCRecoveryConfig)
 
     def __post_init__(self) -> None:
         if not self.enable:
             return
+        if self.backend not in {"async", "rtc"}:
+            raise ValueError("`remote_policy.backend` must be async or rtc.")
         if not self.server_address:
             raise ValueError("`remote_policy.server_address` cannot be empty.")
         if not self.policy_type:
@@ -77,6 +93,18 @@ class RemotePolicyRecordConfig:
             )
         if self.actions_per_chunk <= 0:
             raise ValueError("`remote_policy.actions_per_chunk` must be positive.")
+        if self.backend == "rtc":
+            if self.policy_type not in SUPPORTED_POLICIES:
+                raise ValueError(f"RTC supports {SUPPORTED_POLICIES}, got {self.policy_type}")
+            self.policy_device = normalize_policy_device(self.policy_device)
+            self.rtc.validate_chunk_size(self.actions_per_chunk)
+            if self.recovery.enabled and self.recovery.prefix_steps > self.rtc.execution_horizon:
+                raise ValueError("recovery.prefix_steps must be <= rtc.execution_horizon")
+            positive_finite("remote_policy.connect_timeout_s", self.connect_timeout_s)
+            positive_finite("remote_policy.rpc_timeout_s", self.rpc_timeout_s)
+            if self.action_sg_window not in ACTION_SG_WINDOWS:
+                raise ValueError("remote_policy.action_sg_window must be 0, 5, or 7")
+            return
         if not 0 <= self.chunk_size_threshold <= 1:
             raise ValueError("`remote_policy.chunk_size_threshold` must be between 0 and 1.")
         if self.aggregate_fn_name not in AGGREGATE_FUNCTIONS:

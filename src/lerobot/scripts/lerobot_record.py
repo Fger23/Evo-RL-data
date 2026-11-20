@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import logging
+from datetime import datetime
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -218,6 +219,8 @@ class RecordConfig:
     display_compressed_images: bool = True
     # Use vocal synthesis to read events.
     play_sounds: bool = True
+    # Optional recording log. RTC rollout uses this for timing and full action records.
+    log_file: str | None = None
     # Resume recording on an existing dataset.
     resume: bool = False
     # In policy mode, broadcast the same robot action to the teleop arm via `teleop.send_feedback`.
@@ -353,6 +356,12 @@ def _finish_pkl_recording(
     def disconnect_if_connected(device):
         if device.is_connected:
             device.disconnect()
+            return
+        # A bimanual connect may fail after one arm has already connected.
+        for side in ("left_arm", "right_arm"):
+            arm = getattr(device, side, None)
+            if arm is not None and arm.is_connected:
+                attempt(f"disconnect partial {side}", arm.disconnect)
 
     if policy_sync_executor is not None:
         attempt("stop policy dispatch", policy_sync_executor.shutdown)
@@ -377,7 +386,13 @@ def _finish_pkl_recording(
 @with_rerun_cleanup
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
-    init_logging()
+    rtc_recording = cfg.remote_policy.enable and cfg.remote_policy.backend == "rtc"
+    if rtc_recording and cfg.log_file is None:
+        cfg.log_file = f"logs/rtc_rollout_{datetime.now():%Y%m%d_%H%M%S_%f}.log"
+    log_file = None if cfg.log_file is None else Path(cfg.log_file).resolve()
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+    init_logging(log_file=log_file)
     if cfg.dataset.storage not in {"lerobot", "pkl"}:
         raise ValueError("dataset.storage must be lerobot or pkl")
     if cfg.dataset.storage == "pkl":
@@ -385,8 +400,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             raise ValueError("PKL capture resume is not implemented; use a new root")
         if cfg.dataset.push_to_hub:
             raise ValueError("PKL mode requires dataset.push_to_hub=false; upload after conversion")
-        if cfg.dataset.fps != 30 or not cfg.dataset.video:
-            raise ValueError("PKL mode requires dataset.fps=30 and dataset.video=true")
+        if type(cfg.dataset.fps) is not int or cfg.dataset.fps <= 0 or not cfg.dataset.video:
+            raise ValueError("PKL mode requires a positive integer dataset.fps and dataset.video=true")
     if cfg.require_episode_success_label and not cfg.enable_episode_outcome_labeling:
         raise ValueError(
             "`require_episode_success_label=true` requires `enable_episode_outcome_labeling=true`."
@@ -428,6 +443,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "dtype": "string",
             "shape": (1,),
             "names": ["collector_policy_id"],
+        }
+    action_logging = nullcontext()
+    if rtc_recording:
+        from lerobot.inference_time_rtc.logging_utils import log_actions_to_file
+
+        action_logging = log_actions_to_file(log_file)
+        dataset_features["complementary_info.policy_available"] = {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["policy_available"],
         }
 
     dataset = None
@@ -501,7 +526,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
         if cfg.remote_policy.enable:
-            remote_policy_client = RemotePolicyActionClient(
+            remote_client_class = RemotePolicyActionClient
+            if rtc_recording:
+                from lerobot.inference_time_rtc.recording_client import RTCPolicyActionClient
+
+                remote_client_class = RTCPolicyActionClient
+            remote_policy_client = remote_client_class(
                 cfg=cfg.remote_policy,
                 robot=robot,
                 fps=cfg.dataset.fps,
@@ -518,10 +548,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
         collector_policy_id_human = cfg.collector_policy_id_human
 
+        # Complete model selection and compile warmup before connecting actuators.
+        if rtc_recording:
+            remote_policy_client.start()
+            if cfg.collector_policy_id_policy in (None, cfg.remote_policy.pretrained_name_or_path):
+                collector_policy_id_policy = remote_policy_client.policy_id
         robot.connect()
         if teleop is not None:
             teleop.connect()
-        if remote_policy_client is not None:
+        if remote_policy_client is not None and not rtc_recording:
             remote_policy_client.start()
         on_record_connected = getattr(cfg, "_on_record_connected", None)
         if callable(on_record_connected):
@@ -546,7 +581,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             episode_failure_key=cfg.episode_failure_key if cfg.enable_episode_outcome_labeling else None,
         )
 
-        with (nullcontext() if cfg.dataset.storage == "pkl" else VideoEncodingManager(dataset)):
+        with action_logging, (nullcontext() if cfg.dataset.storage == "pkl" else VideoEncodingManager(dataset)):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["episode_outcome"] = None
@@ -576,6 +611,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                 )
+                if rtc_recording:
+                    remote_policy_client.pause()
 
                 episode_success = None
                 if cfg.enable_episode_outcome_labeling:

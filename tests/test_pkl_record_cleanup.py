@@ -118,6 +118,31 @@ class CleanupTests(unittest.TestCase):
             metadata_create.assert_not_called()
             self.assertFalse(target.exists())
 
+    def test_positive_integer_fps_is_accepted_before_metadata_creation(self):
+        module_path = ROOT / "src/lerobot/datasets/pkl_dataset.py"
+        spec = importlib.util.spec_from_file_location("pkl_storage_fps_test", module_path)
+        storage = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(storage)
+        dataset_module = types.ModuleType("lerobot.datasets.lerobot_dataset")
+        dataset_module.VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1"}
+        metadata_create = Mock(side_effect=RuntimeError("metadata creation reached"))
+        dataset_module.LeRobotDatasetMetadata = SimpleNamespace(create=metadata_create)
+        utils_module = types.ModuleType("lerobot.datasets.utils")
+        utils_module.validate_frame = Mock()
+        with patch.dict(sys.modules, {
+            "lerobot.datasets.lerobot_dataset": dataset_module,
+            "lerobot.datasets.utils": utils_module,
+        }):
+            for fps in (20, 25, 30):
+                with self.subTest(fps=fps), self.assertRaisesRegex(RuntimeError, "metadata creation reached"):
+                    storage.PklDataset.create("local/test", fps, {}, image_encoding="raw")
+                self.assertEqual(metadata_create.call_args.kwargs["fps"], fps)
+            metadata_create.reset_mock()
+            for fps in (0, -1, 25.0, True, "25", None):
+                with self.subTest(fps=fps), self.assertRaisesRegex(ValueError, "positive integer fps"):
+                    storage.PklDataset.create("local/test", fps, {}, image_encoding="raw")
+            metadata_create.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

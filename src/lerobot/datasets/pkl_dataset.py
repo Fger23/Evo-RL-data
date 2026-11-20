@@ -100,8 +100,8 @@ class PklDataset:
         from lerobot.datasets.lerobot_dataset import VALID_VIDEO_CODECS, LeRobotDatasetMetadata
         from lerobot.datasets.utils import validate_frame
 
-        if fps != 30 or not use_videos:
-            raise ValueError("PKL capture currently requires fps=30 and video=true")
+        if type(fps) is not int or fps <= 0 or not use_videos:
+            raise ValueError("PKL capture requires a positive integer fps and video=true")
         if queue_frames < 1 or shard_mb < 1 or sync_seconds <= 0:
             raise ValueError("Invalid PKL queue/shard/sync configuration")
         if vcodec not in VALID_VIDEO_CODECS:

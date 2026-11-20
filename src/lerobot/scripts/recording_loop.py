@@ -195,10 +195,13 @@ def record_loop(
     zero_policy_action = dict.fromkeys(action_feature_names, 0.0)
     has_teleop = isinstance(teleop, (Teleoperator, list))
     has_policy_source = policy is not None or remote_policy_client is not None
+    rtc_recording = getattr(getattr(remote_policy_client, "cfg", None), "backend", "async") == "rtc"
     intervention_enabled = intervention_state_machine_enabled and has_policy_source and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
     teleop_fallback_warned = False
+    last_sent_action: RobotAction | None = None
+    rtc_waiting_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
     if isinstance(teleop, Teleoperator):
@@ -292,8 +295,10 @@ def record_loop(
         if events.get("toggle_intervention", False):
             events["toggle_intervention"] = False
             if intervention_enabled:
-                if intervention_state == INTERVENTION_STATE_POLICY:
+                if intervention_state != INTERVENTION_STATE_ACTIVE:
                     intervention_state = INTERVENTION_STATE_ACTIVE
+                    if rtc_recording:
+                        remote_policy_client.pause()
                     set_teleop_manual_control(True)
                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:
@@ -353,6 +358,12 @@ def record_loop(
                 )
                 act_processed_policy = make_robot_action(policy_action, dataset.features)
 
+        rtc_waiting = (
+            rtc_recording
+            and intervention_state != INTERVENTION_STATE_ACTIVE
+            and act_processed_policy is None
+        )
+
         if isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
 
@@ -367,7 +378,7 @@ def record_loop(
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
 
-        if act_processed_policy is None and act_processed_teleop is None:
+        if act_processed_policy is None and act_processed_teleop is None and not rtc_waiting:
             logging.info(
                 "No policy or teleoperator provided, skipping action generation."
                 "This is likely to happen when resetting the environment without a teleop device."
@@ -409,8 +420,20 @@ def record_loop(
                         "Intervention is active but no teleop/policy action is available; sending zero action."
                     )
                     teleop_fallback_warned = True
+        elif rtc_waiting:
+            # Keep the current target while the RPC worker runs. The keyboard
+            # and teleoperator remain responsive throughout bootstrap and stalls.
+            action_values = (
+                dict(last_sent_action)
+                if last_sent_action is not None
+                else {name: float(obs[name]) for name in robot.action_features}
+            )
+            if not rtc_waiting_warned:
+                logging.warning("RTC rollout is holding its target while waiting for policy actions; press i for takeover")
+                rtc_waiting_warned = True
         else:
             action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
+            rtc_waiting_warned = False
 
         # if policy is None or (
         #     intervention_enabled
@@ -439,10 +462,39 @@ def record_loop(
                 "robot.send_action",
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
+        executed_action = robot_action_to_send if _sent_action is None else _sent_action
+        if rtc_recording:
+            from lerobot.inference_time_rtc.logging_utils import log_action_event
+
+            if _sent_action is not None:
+                # Disabled action channels (for example an unsynchronized
+                # gripper) keep their observed value in the full dataset vector.
+                executed_action = {
+                    name: _sent_action[name] if name in _sent_action else float(obs[name])
+                    for name in robot.action_features
+                }
+            last_sent_action = dict(executed_action)
+            reservation = remote_policy_client.last_reservation if selected_from_policy else None
+            log_action_event(
+                "sent_action",
+                request_id=None if reservation is None else reservation.request_id,
+                step=None if reservation is None else reservation.step,
+                chunk_index=None if reservation is None else reservation.chunk_index,
+                episode_index=None if dataset is None else dataset.num_episodes,
+                timestep=step_idx,
+                state=intervention_state,
+                policy_action_available=act_processed_policy is not None,
+                holding=rtc_waiting,
+                sent_monotonic_ns=time.monotonic_ns(),
+                requested_action=dict(robot_action_to_send),
+                sent_action=None if _sent_action is None else dict(_sent_action),
+                recorded_action=dict(executed_action),
+            )
 
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            stored_action = executed_action if rtc_recording else action_values
+            action_frame = build_dataset_frame(dataset.features, stored_action, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
                 dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
             )
@@ -452,6 +504,10 @@ def record_loop(
                 frame["complementary_info.is_intervention"] = np.array([is_intervention], dtype=np.float32)
             if "complementary_info.state" in dataset.features:
                 frame["complementary_info.state"] = np.array([intervention_state], dtype=np.float32)
+            if "complementary_info.policy_available" in dataset.features:
+                frame["complementary_info.policy_available"] = np.array(
+                    [float(act_processed_policy is not None)], dtype=np.float32
+                )
             if "complementary_info.collector_policy_id" in dataset.features:
                 frame["complementary_info.collector_policy_id"] = resolve_collector_policy_id(
                     intervention_enabled=intervention_enabled,
@@ -467,7 +523,7 @@ def record_loop(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
 
-        if intervention_state == INTERVENTION_STATE_RELEASE:
+        if intervention_state == INTERVENTION_STATE_RELEASE and not rtc_waiting:
             intervention_state = INTERVENTION_STATE_POLICY
 
         dt_s = time.perf_counter() - start_loop_t

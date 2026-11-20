@@ -224,8 +224,9 @@ def capture_info(source):
         raise ValueError("Capture is not closed. Finish recording successfully before converting")
     with (root / "capture.pkl").open("rb") as stream:
         info = pickle.load(stream)
-    if info.get("format") not in {"evo-pkl-v1", "evo-pkl-v2"} or info.get("fps") != 30:
-        raise ValueError("Expected an evo-pkl-v1/v2 capture recorded at 30 FPS")
+    if (info.get("format") not in {"evo-pkl-v1", "evo-pkl-v2"}
+            or type(info.get("fps")) is not int or info["fps"] <= 0):
+        raise ValueError("Expected an evo-pkl-v1/v2 capture with a positive integer FPS")
     encoding = info.get("image_encoding", "raw")
     if encoding not in {"raw", "png"} or (info["format"] == "evo-pkl-v2" and encoding != "png"):
         raise ValueError("Unsupported PKL image encoding")
@@ -287,14 +288,17 @@ def _validate_capture(info, episodes, bar):
     return total
 
 
-def verify_output(output, expected_episodes, expected_frames):
+def verify_output(output, expected_episodes, expected_frames, expected_fps=30):
     import av
     import pyarrow.parquet as pq
 
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
+    if type(expected_fps) is not int or expected_fps <= 0:
+        raise ValueError("Expected FPS must be a positive integer")
     meta = LeRobotDatasetMetadata("local/converted", root=output)
-    if meta.total_episodes != expected_episodes or meta.total_frames != expected_frames or meta.fps != 30:
+    if (meta.total_episodes != expected_episodes or meta.total_frames != expected_frames
+            or meta.fps != expected_fps):
         raise ValueError("Converted dataset metadata counts/FPS do not match capture")
     rows = sum(pq.ParquetFile(path).metadata.num_rows for path in (output / "data").rglob("*.parquet"))
     if rows != expected_frames:
@@ -316,7 +320,7 @@ def verify_output(output, expected_episodes, expected_frames):
                 raise ValueError(f"Decoded video frame count mismatch: {path}")
             if (stream.height, stream.width, 3) != shapes[path]:
                 raise ValueError(f"Video resolution mismatch: {path}")
-            if stream.average_rate is None or abs(float(stream.average_rate) - 30) > 1e-6:
+            if stream.average_rate is None or abs(float(stream.average_rate) - expected_fps) > 1e-6:
                 raise ValueError(f"Video FPS mismatch: {path}")
 
 
@@ -393,7 +397,7 @@ def _upload_dataset(output, host, user, remote_directory, port, ssh_options, env
     output = reject_symlinks(output)
     with dataset_lock(output):
         marker = json.loads((output / "conversion.complete.json").read_text(encoding="utf-8"))
-        verify_output(output, marker["episodes"], marker["frames"])
+        verify_output(output, marker["episodes"], marker["frames"], expected_fps=marker.get("fps", 30))
         if marker.get("files") is not None and not verify_manifest(
                 output, marker["files"], exclude=("conversion.complete.json", "upload.sha256.json")):
             raise ValueError("Dataset SHA256 mismatch; refusing to upload modified conversion output")

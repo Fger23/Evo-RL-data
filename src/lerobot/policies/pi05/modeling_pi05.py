@@ -20,7 +20,7 @@ import math
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -28,6 +28,9 @@ from torch import Tensor, nn
 from typing_extensions import Unpack
 
 from lerobot.utils.import_utils import _transformers_available
+
+if TYPE_CHECKING:
+    from lerobot.inference_time_rtc.modeling_rtc import InputGradientRTCProcessor, PreparedRTCPrefix
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
@@ -57,6 +60,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    prepared_rtc_prefix: "PreparedRTCPrefix"
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -820,11 +824,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         dt = -1.0 / num_steps
+        prepared_rtc_prefix = kwargs.get("prepared_rtc_prefix")
 
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_scalar = torch.tensor(time, dtype=torch.float32, device=device)
+            time_tensor = time_scalar.expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -834,7 +840,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
+            if prepared_rtc_prefix is not None:
+                processor = cast("InputGradientRTCProcessor", self.rtc_processor)
+                v_t = processor.denoise_prepared_step(
+                    x_t, prepared_rtc_prefix, time_scalar, denoise_step_partial_call
+                )
+            elif self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
