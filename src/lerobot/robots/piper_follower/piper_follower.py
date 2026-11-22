@@ -33,6 +33,7 @@ from lerobot.utils.piper_sdk import (
     unit_to_milli,
     wait_enable_piper,
 )
+from lerobot.utils.piper_teleop import PiperTeleopFeedback
 from lerobot.utils.utils import enter_pressed, move_cursor_up
 
 from ..robot import Robot
@@ -55,6 +56,8 @@ class PiperFollower(Robot):
         self._is_connected = False
         self._last_mode_refresh_t = 0.0
         self._teleop_send_only_mode = False
+        self._teleop_joint_feedback = False
+        self._can_feedback: PiperTeleopFeedback | None = None
 
         interface_cls, _ = get_piper_sdk()
         self.arm = interface_cls(
@@ -94,17 +97,24 @@ class PiperFollower(Robot):
             raise RuntimeError("teleop send-only mode must be configured before connecting the robot.")
         self._teleop_send_only_mode = enabled
 
+    def set_teleop_joint_feedback(self) -> None:
+        if self._is_connected:
+            raise RuntimeError("PiPER teleop feedback must be configured before connecting the follower.")
+        self._teleop_joint_feedback = True
+
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        self.arm.ConnectPort(start_thread=not self._teleop_send_only_mode)
-        if self.config.startup_sleep_s > 0:
-            time.sleep(self.config.startup_sleep_s)
-        if not self._teleop_send_only_mode:
-            guard_piper_ctrl_mode_on_connect(arm=self.arm, interface_name=self.config.port)
-
-        self._is_connected = True
+        receive_feedback = self._teleop_joint_feedback or not self._teleop_send_only_mode
         connected_cameras = []
         try:
+            if self._teleop_joint_feedback:
+                self._can_feedback = PiperTeleopFeedback(self.arm)
+            self.arm.ConnectPort(start_thread=receive_feedback)
+            if self.config.startup_sleep_s > 0:
+                time.sleep(self.config.startup_sleep_s)
+            if receive_feedback:
+                guard_piper_ctrl_mode_on_connect(arm=self.arm, interface_name=self.config.port)
+            self._is_connected = True
             self.configure()
             should_auto_calibrate = not self.is_calibrated and calibrate and self.config.require_calibration
             if should_auto_calibrate:
@@ -117,23 +127,51 @@ class PiperFollower(Robot):
             # This keeps connect(calibrate=False) commandable for callers that only want to skip interactive calibration.
             should_enable = self.config.enable_on_connect
             if should_enable:
-                if self._teleop_send_only_mode:
+                if not receive_feedback:
                     self.arm.EnablePiper()
                 elif not self._wait_enable(self.config.enable_timeout_s):
+                    if self._teleop_joint_feedback:
+                        raise RuntimeError(f"[{self.config.port}] PiPER follower did not enable for teleop.")
                     logger.warning("Piper follower did not report enabled state before timeout.")
 
             if not self._teleop_send_only_mode:
                 for cam in self.cameras.values():
                     cam.connect()
                     connected_cameras.append(cam)
-        except Exception:
-            self.arm.DisconnectPort()
+        except BaseException:
+            self._close_can()
             for cam in connected_cameras:
                 cam.disconnect()
             self._is_connected = False
             raise
 
         logger.info("%s connected.", self)
+
+    @check_if_not_connected
+    def get_teleop_joint_feedback(self) -> dict[str, float] | None:
+        if self._can_feedback is None:
+            raise RuntimeError("PiPER follower was connected without teleop feedback.")
+        if self._can_feedback.ctrl_mode() != 0x01:
+            return None
+        pose = self._can_feedback.joint_positions()
+        if pose is None or self._use_uncalibrated_passthrough():
+            return pose
+        if not self.is_calibrated:
+            raise RuntimeError(f"{self} needs calibration before PiPER teleop.")
+        for key in pose:
+            cal = self.calibration[key]
+            centered = pose[key] - self._from_calibration_units(cal.homing_offset)
+            pose[key] = -centered if cal.drive_mode else centered
+        return pose
+
+    def _close_can(self) -> None:
+        try:
+            self.arm.DisconnectPort()
+        finally:
+            if self._can_feedback is not None:
+                self._can_feedback.close()
+                self._can_feedback = None
+            self._is_connected = False
 
     def _use_uncalibrated_passthrough(self) -> bool:
         return not self.is_calibrated and not self.config.require_calibration
@@ -314,11 +352,10 @@ class PiperFollower(Robot):
             if self.config.disable_on_disconnect:
                 self.arm.DisableArm(7)
         finally:
-            self.arm.DisconnectPort()
+            self._close_can()
             for cam in self.cameras.values():
                 if cam.is_connected:
                     cam.disconnect()
-            self._is_connected = False
             logger.info("%s disconnected.", self)
 
 

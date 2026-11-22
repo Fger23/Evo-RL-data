@@ -47,6 +47,7 @@ from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.piper_teleop import PiperTeleopHandoff
 from lerobot.utils.recording_annotations import resolve_collector_policy_id
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device
@@ -200,7 +201,7 @@ def record_loop(
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
     teleop_fallback_warned = False
-    last_sent_action: RobotAction | None = None
+    last_rtc_target: RobotAction | None = None
     rtc_waiting_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
@@ -208,6 +209,15 @@ def record_loop(
         teleop_arm_for_mode_switch = teleop
     elif isinstance(teleop, list):
         teleop_arm_for_mode_switch = teleop_arm
+    piper_teleop = getattr(teleop_arm_for_mode_switch, "uses_firmware_leader_mode", False)
+    piper_handoff = (
+        PiperTeleopHandoff(robot.get_teleop_joint_feedback)
+        if piper_teleop and not has_policy_source
+        else None
+    )
+    piper_takeover_forwarding = False
+    piper_takeover_waiting = False
+    piper_takeover_missing_sides = None
 
     def set_teleop_manual_control(enabled: bool) -> None:
         if teleop_arm_for_mode_switch is None:
@@ -217,6 +227,9 @@ def record_loop(
         try:
             teleop_arm_for_mode_switch.set_manual_control(enabled)
         except Exception:
+            if piper_teleop:
+                # A partially switched pair must never start following.
+                raise
             logging.exception("Failed to switch teleop manual-control mode to %s", enabled)
 
     if not has_policy_source:
@@ -237,7 +250,7 @@ def record_loop(
         cond_policy_runtime_state = _capture_policy_runtime_state(policy)
         uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
 
-    if intervention_enabled:
+    if intervention_enabled or (piper_teleop and has_policy_source):
         # Start in S0: policy drives both arms, teleop arm should accept feedback commands.
         set_teleop_manual_control(False)
 
@@ -296,14 +309,20 @@ def record_loop(
             events["toggle_intervention"] = False
             if intervention_enabled:
                 if intervention_state != INTERVENTION_STATE_ACTIVE:
-                    intervention_state = INTERVENTION_STATE_ACTIVE
                     if rtc_recording:
                         remote_policy_client.pause()
                     set_teleop_manual_control(True)
-                    logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
+                    intervention_state = INTERVENTION_STATE_ACTIVE
+                    if piper_teleop:
+                        piper_takeover_forwarding = False
+                        piper_takeover_waiting = False
+                        piper_takeover_missing_sides = None
+                        logging.info("PiPER takeover requested (S1): forwarding fresh leader targets when available.")
+                    else:
+                        logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:
-                    intervention_state = INTERVENTION_STATE_RELEASE
                     set_teleop_manual_control(False)
+                    intervention_state = INTERVENTION_STATE_RELEASE
                     if policy is not None and preprocessor is not None and postprocessor is not None:
                         policy.reset()
                         preprocessor.reset()
@@ -333,7 +352,7 @@ def record_loop(
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
-        if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+        if intervention_state != INTERVENTION_STATE_ACTIVE:
             if remote_policy_client is not None:
                 act_processed_policy = remote_policy_client.get_action(
                     observation=obs,
@@ -364,7 +383,32 @@ def record_loop(
             and act_processed_policy is None
         )
 
-        if isinstance(teleop, Teleoperator):
+        piper_manual = piper_teleop and (
+            not has_policy_source or intervention_state == INTERVENTION_STATE_ACTIVE
+        )
+        piper_takeover = piper_manual and intervention_state == INTERVENTION_STATE_ACTIVE
+        if piper_manual:
+            read_action = teleop_arm_for_mode_switch.get_action_if_ready
+            if piper_takeover:
+                read_action = getattr(teleop_arm_for_mode_switch, "get_takeover_action_if_ready", read_action)
+            act = run_with_connection_retry("teleop.get_action_if_ready", read_action)
+            if piper_takeover and act is not None:
+                missing_sides = tuple(
+                    side
+                    for side in ("left", "right")
+                    if f"{side}_joint_1.pos" in robot.action_features and f"{side}_joint_1.pos" not in act
+                )
+                if missing_sides != piper_takeover_missing_sides:
+                    if missing_sides:
+                        logging.warning(
+                            "PiPER takeover holding %s arm: no fresh joint snapshot", ", ".join(missing_sides)
+                        )
+                    elif piper_takeover_missing_sides:
+                        logging.info("PiPER takeover has fresh joint snapshots from both arms again")
+                    piper_takeover_missing_sides = missing_sides
+            if act is not None:
+                act_processed_teleop = teleop_action_processor((act, obs))
+        elif not piper_teleop and isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
@@ -378,7 +422,7 @@ def record_loop(
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
 
-        if act_processed_policy is None and act_processed_teleop is None and not rtc_waiting:
+        if act_processed_policy is None and act_processed_teleop is None and not (rtc_waiting or piper_manual):
             logging.info(
                 "No policy or teleoperator provided, skipping action generation."
                 "This is likely to happen when resetting the environment without a teleop device."
@@ -395,7 +439,10 @@ def record_loop(
         )
 
         is_intervention = 0.0
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+        if piper_manual:
+            action_values = act_processed_teleop
+            is_intervention = float(intervention_enabled)
+        elif intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
             is_intervention = 1.0
             if act_processed_teleop is not None:
                 action_values = act_processed_teleop
@@ -424,8 +471,8 @@ def record_loop(
             # Keep the current target while the RPC worker runs. The keyboard
             # and teleoperator remain responsive throughout bootstrap and stalls.
             action_values = (
-                dict(last_sent_action)
-                if last_sent_action is not None
+                dict(last_rtc_target)
+                if last_rtc_target is not None
                 else {name: float(obs[name]) for name in robot.action_features}
             )
             if not rtc_waiting_warned:
@@ -443,7 +490,22 @@ def record_loop(
         # else:
         #     action_filter.reset()
         # Applies a pipeline to the action, default is IdentityProcessor
-        robot_action_to_send = robot_action_processor((action_values, obs))
+        robot_action_to_send = (
+            robot_action_processor((action_values, obs)) if action_values is not None else None
+        )
+        if piper_manual:
+            if piper_handoff is not None:
+                robot_action_to_send = piper_handoff.prepare(robot_action_to_send)
+            if robot_action_to_send is None:
+                # Leave the previous hardware target alone. Do not send stale
+                # or zero actions, and do not record a human command here.
+                if piper_takeover and not piper_takeover_waiting:
+                    logging.warning("PiPER takeover waiting for a complete, fresh leader joint snapshot")
+                    piper_takeover_waiting = True
+                precise_sleep(max(1 / fps - (time.perf_counter() - start_loop_t), 0.0))
+                timestamp = time.perf_counter() - start_episode_t
+                continue
+            action_values = robot_action_to_send
 
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
@@ -462,6 +524,12 @@ def record_loop(
                 "robot.send_action",
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
+        if piper_takeover and (_sent_action is None or _sent_action) and (
+            not piper_takeover_forwarding or piper_takeover_waiting
+        ):
+            logging.info("PiPER takeover forwarding leader targets (S1)")
+            piper_takeover_forwarding = True
+            piper_takeover_waiting = False
         executed_action = robot_action_to_send if _sent_action is None else _sent_action
         if rtc_recording:
             from lerobot.inference_time_rtc.logging_utils import log_action_event
@@ -473,7 +541,16 @@ def record_loop(
                     name: _sent_action[name] if name in _sent_action else float(obs[name])
                     for name in robot.action_features
                 }
-            last_sent_action = dict(executed_action)
+            if piper_takeover:
+                # Dataset observation fallback is not an actuator target.
+                # Omitted channels retain their last command on policy release.
+                if last_rtc_target is None:
+                    last_rtc_target = {}
+                last_rtc_target.update(robot_action_to_send if _sent_action is None else _sent_action)
+            elif not rtc_waiting:
+                last_rtc_target = dict(executed_action)
+            elif last_rtc_target is None:
+                last_rtc_target = dict(robot_action_to_send)
             reservation = remote_policy_client.last_reservation if selected_from_policy else None
             log_action_event(
                 "sent_action",
@@ -494,6 +571,11 @@ def record_loop(
         # Write to dataset
         if dataset is not None:
             stored_action = executed_action if rtc_recording else action_values
+            if piper_manual and not rtc_recording:
+                stored_action = {
+                    name: stored_action[name] if name in stored_action else float(obs[name])
+                    for name in action_feature_names
+                }
             action_frame = build_dataset_frame(dataset.features, stored_action, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
                 dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
@@ -531,3 +613,5 @@ def record_loop(
 
         timestamp = time.perf_counter() - start_episode_t ## 更新已录制时长
         step_idx += 1
+
+    return step_idx

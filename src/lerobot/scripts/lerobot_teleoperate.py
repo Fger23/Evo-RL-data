@@ -104,6 +104,7 @@ from lerobot.teleoperators import (  # noqa: F401
 )
 from lerobot.utils.control_utils import sanity_check_bimanual_piper_pair
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.piper_teleop import PiperTeleopHandoff
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, with_rerun_cleanup
@@ -190,6 +191,11 @@ def teleop_loop(
     should_fetch_obs = _teleop_needs_robot_observation(
         display_data, teleop_action_processor, robot_action_processor
     )
+    piper_handoff = (
+        PiperTeleopHandoff(robot.get_teleop_joint_feedback)
+        if getattr(teleop, "uses_firmware_leader_mode", False)
+        else None
+    )
 
     while True:
         loop_start = time.perf_counter()
@@ -201,18 +207,19 @@ def teleop_loop(
         obs = robot.get_observation() if should_fetch_obs else {}
 
         # Get teleop action
-        raw_action = teleop.get_action()
+        raw_action = teleop.get_action() if piper_handoff is None else teleop.get_action_if_ready()
 
-        # Process teleop action through pipeline
-        teleop_action = teleop_action_processor((raw_action, obs))
+        robot_action_to_send = teleop_action = None
+        if raw_action is not None:
+            teleop_action = teleop_action_processor((raw_action, obs))
+            robot_action_to_send = robot_action_processor((teleop_action, obs))
+        if piper_handoff is not None:
+            robot_action_to_send = piper_handoff.prepare(robot_action_to_send)
 
-        # Process action for robot through pipeline
-        robot_action_to_send = robot_action_processor((teleop_action, obs))
+        if robot_action_to_send is not None:
+            robot.send_action(robot_action_to_send)
 
-        # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
-        _ = robot.send_action(robot_action_to_send)
-
-        if display_data:
+        if display_data and robot_action_to_send is not None:
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)
 
@@ -265,11 +272,12 @@ def teleoperate(cfg: TeleoperateConfig):
         cfg.display_data, teleop_action_processor, robot_action_processor
     )
     _configure_robot_for_lightweight_teleop(robot, should_fetch_obs)
-
-    teleop.connect()
-    robot.connect()
+    if getattr(teleop, "uses_firmware_leader_mode", False):
+        robot.set_teleop_joint_feedback()
 
     try:
+        teleop.connect()
+        robot.connect()
         teleop_loop(
             teleop=teleop,
             robot=robot,
@@ -284,8 +292,12 @@ def teleoperate(cfg: TeleoperateConfig):
     except KeyboardInterrupt:
         pass
     finally:
-        teleop.disconnect()
-        robot.disconnect()
+        try:
+            if robot.is_connected:
+                robot.disconnect()
+        finally:
+            if teleop.is_connected:
+                teleop.disconnect()
 
 
 def main():

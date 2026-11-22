@@ -17,6 +17,7 @@
 import logging
 import multiprocessing as mp
 import traceback
+from contextlib import suppress
 from functools import cached_property
 from typing import Any
 
@@ -27,8 +28,8 @@ from lerobot.teleoperators.piper_leader import (
     PiperXLeader,
     PiperXLeaderConfig,
 )
-from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
 
 from ..teleoperator import Teleoperator
 from .config_bi_piper_leader import BiPiperLeaderConfig, BiPiperXLeaderConfig
@@ -119,15 +120,14 @@ class _PiperLeaderProcessProxy:
         if response["ok"]:
             return response.get("result")
         raise RuntimeError(
-            f"bi_piper leader worker command '{command}' failed: {response['error']}\n"
-            f"{response['traceback']}"
+            f"bi_piper leader worker command '{command}' failed: {response['error']}\n{response['traceback']}"
         )
 
-    def connect(self, calibrate: bool = True) -> None:
+    def connect(self, calibrate: bool = True, *, for_policy: bool = False) -> None:
         try:
-            self._call("connect", calibrate)
+            self._call("connect", calibrate, for_policy=for_policy)
             self._is_connected = True
-        except Exception:
+        except BaseException:
             self.disconnect()
             raise
 
@@ -146,6 +146,9 @@ class _PiperLeaderProcessProxy:
     def get_action(self) -> RobotAction:
         return self._call("get_action")
 
+    def get_action_if_ready(self) -> RobotAction | None:
+        return self._call("get_action_if_ready")
+
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         self._call("send_feedback", feedback)
 
@@ -155,19 +158,13 @@ class _PiperLeaderProcessProxy:
             return
 
         if self._parent_conn is not None:
-            try:
+            with suppress(Exception):
                 if self._is_connected:
                     self._call("disconnect")
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 self._parent_conn.send({"command": "__close__"})
-            except Exception:
-                pass
-            try:
+            with suppress(Exception):
                 self._parent_conn.close()
-            except Exception:
-                pass
 
         if self._process.is_alive():
             self._process.join(timeout=2.0)
@@ -184,6 +181,7 @@ class BiPiperLeader(Teleoperator):
     """Bimanual PiPER/PiPER-X leader arms."""
 
     config_class = BiPiperLeaderConfig
+    uses_firmware_leader_mode = True
     name = "bi_piper_leader"
     _side_field_names = (
         "port",
@@ -258,9 +256,14 @@ class BiPiperLeader(Teleoperator):
         return self.left_arm.is_connected and self.right_arm.is_connected
 
     @check_if_already_connected
-    def connect(self, calibrate: bool = True) -> None:
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+    def connect(self, calibrate: bool = True, *, for_policy: bool = False) -> None:
+        kwargs = {"for_policy": True} if for_policy else {}
+        self.left_arm.connect(calibrate, **kwargs)
+        try:
+            self.right_arm.connect(calibrate, **kwargs)
+        except BaseException:
+            self.left_arm.disconnect()
+            raise
 
     @property
     def is_calibrated(self) -> bool:
@@ -285,12 +288,27 @@ class BiPiperLeader(Teleoperator):
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
-        action_dict: RobotAction = {}
-        left_action = self.left_arm.get_action()
-        action_dict.update({f"left_{key}": value for key, value in left_action.items()})
-        right_action = self.right_arm.get_action()
-        action_dict.update({f"right_{key}": value for key, value in right_action.items()})
-        return action_dict
+        action = self.get_action_if_ready()
+        if action is None:
+            raise RuntimeError("Both PiPER leaders must have fresh joint data.")
+        return action
+
+    @check_if_not_connected
+    def get_action_if_ready(self, *, allow_partial: bool = False) -> RobotAction | None:
+        left_action = self.left_arm.get_action_if_ready()
+        right_action = self.right_arm.get_action_if_ready()
+        if not allow_partial and (left_action is None or right_action is None):
+            return None
+        action = {
+            **{f"left_{key}": value for key, value in (left_action or {}).items()},
+            **{f"right_{key}": value for key, value in (right_action or {}).items()},
+        }
+        return action or None
+
+    def get_takeover_action_if_ready(self) -> RobotAction | None:
+        # Each follower is on a separate CAN bus. Dispatch a complete, live arm
+        # without replaying stale targets to its partner.
+        return self.get_action_if_ready(allow_partial=True)
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, Any]) -> None:
@@ -306,8 +324,10 @@ class BiPiperLeader(Teleoperator):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        try:
+            self.left_arm.disconnect()
+        finally:
+            self.right_arm.disconnect()
 
 
 class BiPiperXLeader(BiPiperLeader):

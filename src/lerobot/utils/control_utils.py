@@ -482,7 +482,7 @@ def sanity_check_dataset_robot_compatibility(
 
 
 def sanity_check_bimanual_piper_pair(robot_cfg, teleop_cfg) -> None:
-    """Ensure bimanual PiPER configs are not mixed between PiPER and PiPER-X variants."""
+    """Check PiPER pairing and require different CAN interfaces for every arm."""
     if teleop_cfg is None:
         return
 
@@ -503,4 +503,24 @@ def sanity_check_bimanual_piper_pair(robot_cfg, teleop_cfg) -> None:
         expected = expected_robot_by_teleop[teleop_type]
         raise ValueError(
             f"In bimanual PiPER mode, '{teleop_type}' must be paired with '{expected}', got '{robot_type}'."
+        )
+
+    if teleop_type in expected_robot_by_teleop:
+        ports = [
+            config.port
+            for device in (teleop_cfg, robot_cfg)
+            for config in (device.left_arm_config, device.right_arm_config)
+        ]
+    elif teleop_type in {"piper_leader", "piperx_leader"}:
+        expected_robot = teleop_type.replace("_leader", "_follower")
+        if robot_type != expected_robot:
+            raise ValueError(f"PiPER teleop '{teleop_type}' must be paired with '{expected_robot}'.")
+        ports = [teleop_cfg.port, robot_cfg.port]
+    else:
+        return
+
+    if len(set(ports)) != len(ports):
+        raise ValueError(
+            "PiPER firmware leader mode requires a separate, physically isolated CAN bus for each arm. "
+            f"Configured ports: {ports}."
         )

@@ -116,11 +116,30 @@ class BiPiperFollower(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        try:
+            self.right_arm.connect(calibrate)
+        except BaseException:
+            self.left_arm.disconnect()
+            raise
 
     def set_teleop_send_only_mode(self, enabled: bool) -> None:
         self.left_arm.set_teleop_send_only_mode(enabled)
         self.right_arm.set_teleop_send_only_mode(enabled)
+
+    def set_teleop_joint_feedback(self) -> None:
+        self.left_arm.set_teleop_joint_feedback()
+        self.right_arm.set_teleop_joint_feedback()
+
+    @check_if_not_connected
+    def get_teleop_joint_feedback(self) -> dict[str, float] | None:
+        left = self.left_arm.get_teleop_joint_feedback()
+        right = self.right_arm.get_teleop_joint_feedback()
+        if left is None or right is None:
+            return None
+        return {
+            **{f"left_{key}": value for key, value in left.items()},
+            **{f"right_{key}": value for key, value in right.items()},
+        }
 
     @property
     def is_calibrated(self) -> bool:
@@ -166,8 +185,10 @@ class BiPiperFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        try:
+            self.left_arm.disconnect()
+        finally:
+            self.right_arm.disconnect()
 
 
 class BiPiperXFollower(BiPiperFollower):

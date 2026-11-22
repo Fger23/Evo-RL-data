@@ -16,9 +16,9 @@
 
 import logging
 import time
+from collections.abc import Callable
 from functools import cached_property
-from importlib import resources
-from typing import Any
+from typing import Any, TypeVar
 
 from lerobot.motors import MotorCalibration
 from lerobot.processor import RobotAction
@@ -26,42 +26,28 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from lerobot.utils.piper_sdk import (
     PIPER_ACTION_KEYS,
     PIPER_JOINT_ACTION_KEYS,
-    PIPER_JOINT_NAMES,
     get_piper_sdk,
-    guard_piper_ctrl_mode_on_connect,
-    milli_to_unit,
     parse_piper_log_level,
     unit_to_milli,
     wait_enable_piper,
 )
+from lerobot.utils.piper_teleop import PiperTeleopFeedback
 from lerobot.utils.utils import enter_pressed, move_cursor_up
 
 from ..teleoperator import Teleoperator
 from .config_piper_leader import PiperLeaderConfig, PiperXLeaderConfig
-from .gravity_compensation import PiperGravityCompensationLoop
 
 logger = logging.getLogger(__name__)
 PIPER_CALIB_KEYS = list(PIPER_ACTION_KEYS)
 PIPER_CALIB_IDS = {key: idx for idx, key in enumerate(PIPER_CALIB_KEYS)}
-DEFAULT_PIPER_GRAVITY_URDF = "assets/piper_description/urdf/piper_no_gripper_description.urdf"
-DEFAULT_PIPERX_GRAVITY_URDF = "assets/piper_x_description/urdf/piper_x_description_no_gripper.urdf"
-GIT_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
-MANUAL_CONTROL_FRESH_FEEDBACK_TIMEOUT_S = 0.03
-MANUAL_CONTROL_FRESH_FEEDBACK_POLL_S = 0.001
-
-
-def _ensure_not_lfs_pointer(path_obj: Any, relpath: str) -> None:
-    with path_obj.open("rb") as f:
-        head = f.read(128)
-    if head.startswith(GIT_LFS_POINTER_PREFIX):
-        raise RuntimeError(
-            "Bundled PiPER assets are still Git LFS pointer files. "
-            "Please run `git lfs pull --include="
-            '"src/lerobot/assets/piper_description/**,src/lerobot/assets/piper_x_description/**" '
-            '--exclude="*"` and `git lfs checkout src/lerobot/assets/piper_description '
-            "src/lerobot/assets/piper_x_description`, then retry. "
-            f"(file: {relpath})"
-        )
+PIPER_LEADER_ROLE = 0xFA
+PIPER_CONTROLLED_ROLE = 0xFC
+PIPER_STANDBY_MODE = 0x00
+PIPER_COMMAND_MODE = 0x01
+PIPER_ROLE_SWITCH_TIMEOUT_S = 1.5
+PIPER_COMMAND_RETRY_INTERVAL_S = 0.05
+PIPER_RESTORE_SPEED_RATIO = 20
+T = TypeVar("T")
 
 
 class PiperLeader(Teleoperator):
@@ -69,7 +55,7 @@ class PiperLeader(Teleoperator):
 
     config_class = PiperLeaderConfig
     name = "piper_leader"
-    gravity_comp_urdf_relpath = DEFAULT_PIPER_GRAVITY_URDF
+    uses_firmware_leader_mode = True
 
     def __init__(self, config: PiperLeaderConfig | PiperXLeaderConfig):
         super().__init__(config)
@@ -77,9 +63,11 @@ class PiperLeader(Teleoperator):
         self._is_connected = False
         self._manual_control_enabled: bool | None = None
         self._last_mode_refresh_t = 0.0
-        self._gravity_comp_loop: PiperGravityCompensationLoop | None = None
-        self._last_feedback_joint_timestamp = 0.0
-        self._last_feedback_gripper_timestamp = 0.0
+        self._mirror_mode_pending = False
+        self._can_feedback: PiperTeleopFeedback | None = None
+        self._role_requested_at = 0.0
+        self._mirror_waiting = False
+        self._last_leader_frame_warning = float("-inf")
 
         interface_cls, _ = get_piper_sdk()
         self.arm = interface_cls(
@@ -102,29 +90,25 @@ class PiperLeader(Teleoperator):
         return self._is_connected
 
     @check_if_already_connected
-    def connect(self, calibrate: bool = True) -> None:
-        self.arm.ConnectPort()
-        if self.config.startup_sleep_s > 0:
-            time.sleep(self.config.startup_sleep_s)
-        guard_piper_ctrl_mode_on_connect(arm=self.arm, interface_name=self.config.port)
-
-        self._is_connected = True
-        # Recompute control mode on every fresh connection.
-        self._manual_control_enabled = None
-        self._last_feedback_joint_timestamp = 0.0
-        self._last_feedback_gripper_timestamp = 0.0
+    def connect(self, calibrate: bool = True, *, for_policy: bool = False) -> None:
+        self._can_feedback = PiperTeleopFeedback(self.arm)
         try:
-            self.configure()
-            if not self.is_calibrated and calibrate and self.config.require_calibration:
+            self.arm.ConnectPort()
+            if self.config.startup_sleep_s > 0:
+                time.sleep(self.config.startup_sleep_s)
+            self._is_connected = True
+            needs_calibration = not self.is_calibrated and calibrate and self.config.require_calibration
+            self.set_manual_control(not for_policy or needs_calibration)
+            if needs_calibration:
                 logger.info(
                     "No piper-leader calibration file found for '%s'. Running lerobot-calibrate flow.",
                     self.id,
                 )
                 self.calibrate()
-        except Exception:
-            self._stop_gravity_comp_loop_if_needed()
-            self.arm.DisconnectPort()
-            self._is_connected = False
+                if for_policy:
+                    self.set_manual_control(False)
+        except BaseException:
+            self._close_connection()
             raise
 
         logger.info("%s connected.", self)
@@ -151,6 +135,9 @@ class PiperLeader(Teleoperator):
             if user_input.strip().lower() != "c":
                 return
 
+        if not self.config.sync_gripper:
+            raise RuntimeError("PiPER leader calibration requires gripper feedback.")
+        self.set_manual_control(True)
         logger.info("Running calibration for %s", self)
         input("Move piper-leader to your desired neutral/center pose, then press ENTER...")
         neutral = self._read_raw_action()
@@ -176,12 +163,19 @@ class PiperLeader(Teleoperator):
         self._save_calibration()
         print(f"Calibration saved to {self.calibration_fpath}")
 
-    def _send_command_mode(self) -> None:
-        mit_mode = 0xAD if self.config.command_high_follow else 0x00
-        self.arm.MotionCtrl_2(0x01, 0x01, self.config.command_speed_ratio, mit_mode)
+    def _send_command_mode(self, *, restoring: bool = False) -> None:
+        follow_mode = 0xAD if self.config.command_high_follow and not restoring else 0x00
+        speed = self.config.command_speed_ratio
+        if restoring:
+            speed = min(speed, PIPER_RESTORE_SPEED_RATIO)
+        self.arm.MotionCtrl_2(PIPER_COMMAND_MODE, 0x01, speed, follow_mode)
         self._last_mode_refresh_t = time.monotonic()
 
     def _refresh_command_mode_if_needed(self) -> None:
+        if self._mirror_mode_pending:
+            self._send_command_mode()
+            self._mirror_mode_pending = False
+            return
         interval_s = self.config.mode_refresh_interval_s
         if interval_s <= 0:
             return
@@ -192,185 +186,131 @@ class PiperLeader(Teleoperator):
     def _wait_enable(self, timeout_s: float) -> bool:
         return wait_enable_piper(self.arm, timeout_s)
 
-    def _send_gripper_ctrl(self, gripper_pos_raw: int, enabled: bool, clear_error: bool = False) -> None:
-        if enabled:
-            status_code = 0x03 if clear_error else self.config.gripper_status_code
-        else:
-            status_code = 0x02 if clear_error else 0x00
+    def _send_gripper_ctrl(self, gripper_pos_raw: int) -> None:
         self.arm.GripperCtrl(
             gripper_pos_raw,
-            self.config.gripper_effort_default if enabled else 0,
-            status_code,
+            self.config.gripper_effort_default,
+            self.config.gripper_status_code,
             0x00,
         )
 
-    def _set_gripper_enabled(self, enabled: bool, clear_error: bool = False) -> None:
-        gripper_pos_raw = 0
-        try:
-            gripper_msg = self.arm.GetArmGripperMsgs()
-            gripper_state = getattr(gripper_msg, "gripper_state", None)
-            if gripper_state is not None:
-                gripper_pos_raw = abs(int(getattr(gripper_state, "grippers_angle", 0)))
-        except Exception:
-            logger.debug("Could not read current gripper angle before setting enable=%s.", enabled)
-        self._send_gripper_ctrl(gripper_pos_raw, enabled, clear_error=clear_error)
-
+    @check_if_not_connected
     def set_manual_control(self, enabled: bool) -> None:
-        if not self._is_connected:
+        if self._manual_control_enabled is enabled:
             return
-        if enabled and self.config.passive_mode:
-            # Passive leader: ensure motors stay disabled so the arm can be
-            # backdriven by hand; skip enable + MIT gravity compensation loop.
-            self.arm.DisableArm(7)
-            if self.config.sync_gripper:
-                # 0x02 = disable + clear errors, so a faulted gripper also
-                # becomes backdrivable and resumes broadcasting feedback.
-                self._set_gripper_enabled(False, clear_error=True)
-            self._manual_control_enabled = True
-            return
-        if enabled and self._manual_control_enabled is not True:
-            if not self._wait_enable(self.config.enable_timeout_s):
-                logger.warning(
-                    "Piper leader did not report enabled state before entering gravity compensation."
-                )
-            if self.config.sync_gripper:
-                self._set_gripper_enabled(False)
-            self._ensure_gravity_comp_loop().start()
-            self._manual_control_enabled = True
-            return
-        if not enabled and self._manual_control_enabled is not False:
-            self._stop_gravity_comp_loop_if_needed()
-            self._send_command_mode()
-            if not self._wait_enable(self.config.enable_timeout_s):
-                logger.warning("Piper leader did not report enabled state before timeout.")
-            if self.config.sync_gripper:
-                self._set_gripper_enabled(True)
-            self._manual_control_enabled = False
 
-    def _ensure_gravity_comp_loop(self) -> PiperGravityCompensationLoop:
-        if self._gravity_comp_loop is None:
-            default_urdf = resources.files("lerobot").joinpath(self.gravity_comp_urdf_relpath)
-            if not default_urdf.is_file():
-                raise FileNotFoundError(
-                    "Bundled gravity compensation URDF is missing: "
-                    f"{self.gravity_comp_urdf_relpath}. Reinstall the package."
-                )
-            _ensure_not_lfs_pointer(default_urdf, self.gravity_comp_urdf_relpath)
-            urdf_path = str(default_urdf)
-            self._gravity_comp_loop = PiperGravityCompensationLoop(
-                arm=self.arm,
-                urdf_path=urdf_path,
-                control_hz=self.config.gravity_comp_control_hz,
-                tx_ratio=self.config.gravity_comp_tx_ratio,
-                torque_limit=self.config.gravity_comp_torque_limit,
-                mit_kp=self.config.gravity_comp_mit_kp,
-                mit_kd=self.config.gravity_comp_mit_kd,
-                base_rpy_deg=self.config.gravity_comp_base_rpy_deg,
-                mode_refresh_interval_s=self.config.mode_refresh_interval_s,
-                move_speed_ratio=self.config.command_speed_ratio,
+        can_feedback = self._can_feedback
+        assert can_feedback is not None
+        self._manual_control_enabled = None
+        self._role_requested_at = time.time()
+        role = PIPER_LEADER_ROLE if enabled else PIPER_CONTROLLED_ROLE
+        self.arm.MasterSlaveConfig(role, 0, 0, 0)
+
+        if enabled:
+            # Firmware supplies gravity compensation in leader/zero-force drag
+            # mode. Do not send host MIT torques or position targets in this role.
+            self._last_leader_frame_warning = float("-inf")
+            logger.info("[%s] PiPER firmware leader drag mode is active", self.config.port)
+        else:
+            self._restore_position_control(can_feedback)
+            grip = can_feedback.gripper_width(since=self._role_requested_at)
+            if self.config.sync_gripper and grip is not None:
+                self._send_gripper_ctrl(unit_to_milli(grip))
+            logger.info("[%s] PiPER CAN position-control mode is active", self.config.port)
+        self._manual_control_enabled = enabled
+
+    def _restore_position_control(self, can_feedback: PiperTeleopFeedback) -> None:
+        role_requested_at = self._role_requested_at
+
+        def read_controlled_pose(*, since):
+            if can_feedback.ctrl_mode(since=since) not in (PIPER_STANDBY_MODE, PIPER_COMMAND_MODE):
+                return None
+            return can_feedback.joint_positions(since=since)
+
+        try:
+            self._wait_for(
+                lambda: read_controlled_pose(since=role_requested_at),
+                "fresh controlled-mode status and joint pose after 0xFC",
             )
-        return self._gravity_comp_loop
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} {can_feedback.arm_status_detail(since=role_requested_at)}.") from exc
+        logger.info(
+            "[%s] PiPER exited leader mode: %s",
+            self.config.port,
+            can_feedback.arm_status_detail(since=role_requested_at),
+        )
+        # The SDK MOVE J example confirms enable before selecting position
+        # control. Do this only after receiving feedback from the controlled role.
+        if not self._wait_enable(self.config.enable_timeout_s):
+            raise RuntimeError(
+                f"[{self.config.port}] PiPER did not enable after leaving leader mode; "
+                f"{can_feedback.arm_status_detail(since=role_requested_at)}."
+            )
 
-    def _stop_gravity_comp_loop_if_needed(self) -> None:
-        if self._gravity_comp_loop is not None:
-            self._gravity_comp_loop.stop()
+        command_requested_at: float | None = None
+        next_attempt_at = 0.0
+        attempts = 0
+
+        def activate_command_mode():
+            nonlocal command_requested_at, next_attempt_at, attempts
+            if command_requested_at is not None and (
+                can_feedback.ctrl_mode(since=command_requested_at) == PIPER_COMMAND_MODE
+            ):
+                return True
+            now = time.monotonic()
+            if now < next_attempt_at:
+                return None
+            pose = read_controlled_pose(since=role_requested_at)
+            if pose is None:
+                return None
+            # Retry only at the arm's live pose, never the last model target
+            # or the joint sample from before the role switch.
+            hold = tuple(unit_to_milli(pose[key]) for key in PIPER_JOINT_ACTION_KEYS)
+            self.arm.JointCtrl(*hold)
+            requested_at = time.time()
+            self._send_command_mode(restoring=True)
+            self.arm.JointCtrl(*hold)
+            if command_requested_at is None:
+                command_requested_at = requested_at
+            attempts += 1
+            next_attempt_at = now + PIPER_COMMAND_RETRY_INTERVAL_S
+            return None
+
+        try:
+            self._wait_for(activate_command_mode, "CAN position-control status after restoring command mode")
+        except RuntimeError as exc:
+            detail = can_feedback.arm_status_detail(since=command_requested_at or role_requested_at)
+            raise RuntimeError(f"{exc} Attempts: {attempts}; {detail}.") from exc
+        # Apply the normal mirroring settings with the next position target.
+        self._mirror_mode_pending = True
 
     def configure(self) -> None:
-        self.set_manual_control(self.config.manual_control)
+        self.set_manual_control(True)
 
-    def _read_joint_from_ctrl(self) -> dict[str, float] | None:
-        joint_ctrl_msg = self.arm.GetArmJointCtrl()
-        if getattr(joint_ctrl_msg, "time_stamp", 0.0) <= 0:
-            return None
-        joint_ctrl = getattr(joint_ctrl_msg, "joint_ctrl", None)
-        return {
-            f"{joint_name}.pos": milli_to_unit(getattr(joint_ctrl, joint_name, 0))
-            for joint_name in PIPER_JOINT_NAMES
-        }
-
-    def _read_joint_from_feedback(self) -> dict[str, float] | None:
-        joint_msg = self.arm.GetArmJointMsgs()
-        joint_state = getattr(joint_msg, "joint_state", None)
-        if joint_state is None:
-            return None
-        return {
-            f"{joint_name}.pos": milli_to_unit(getattr(joint_state, joint_name, 0))
-            for joint_name in PIPER_JOINT_NAMES
-        }
-
-    def _read_gripper_from_ctrl(self) -> float | None:
-        gripper_ctrl_msg = self.arm.GetArmGripperCtrl()
-        if getattr(gripper_ctrl_msg, "time_stamp", 0.0) <= 0:
-            return None
-        gripper_ctrl = getattr(gripper_ctrl_msg, "gripper_ctrl", None)
-        return abs(milli_to_unit(getattr(gripper_ctrl, "grippers_angle", 0)))
-
-    def _read_gripper_from_feedback(self) -> float | None:
-        gripper_msg = self.arm.GetArmGripperMsgs()
-        gripper_state = getattr(gripper_msg, "gripper_state", None)
-        if gripper_state is None:
-            return None
-        return abs(milli_to_unit(getattr(gripper_state, "grippers_angle", 0)))
-
-    def _wait_for_fresh_feedback_if_needed(self) -> None:
-        if self._manual_control_enabled is not True:
-            return
-
-        needs_fresh_gripper = self.config.sync_gripper and self.config.fallback_to_feedback
-        deadline = time.monotonic() + MANUAL_CONTROL_FRESH_FEEDBACK_TIMEOUT_S
+    def _wait_for(self, read: Callable[[], T | None], description: str) -> T:
+        deadline = time.monotonic() + PIPER_ROLE_SWITCH_TIMEOUT_S
         while time.monotonic() < deadline:
-            joint_ts = float(getattr(self.arm.GetArmJointMsgs(), "time_stamp", 0.0) or 0.0)
-            has_fresh_joint = joint_ts > self._last_feedback_joint_timestamp
-            if not has_fresh_joint:
-                time.sleep(MANUAL_CONTROL_FRESH_FEEDBACK_POLL_S)
-                continue
-            if not needs_fresh_gripper:
-                return
+            value = read()
+            if value is not None:
+                return value
+            time.sleep(0.005)
+        raise RuntimeError(f"[{self.config.port}] PiPER role transition timed out waiting for {description}.")
 
-            gripper_ts = float(getattr(self.arm.GetArmGripperMsgs(), "time_stamp", 0.0) or 0.0)
-            has_fresh_gripper = gripper_ts > self._last_feedback_gripper_timestamp
-            if has_fresh_gripper:
-                return
-            time.sleep(MANUAL_CONTROL_FRESH_FEEDBACK_POLL_S)
+    def _read_leader_action(self) -> RobotAction | None:
+        assert self._can_feedback is not None
+        return self._can_feedback.leader_action(
+            since=self._role_requested_at, sync_gripper=self.config.sync_gripper
+        )
 
     def _read_raw_action(self) -> RobotAction:
-        used_feedback_for_joints = False
-        action: dict[str, float] | None = None
+        if self._manual_control_enabled is not True:
+            raise RuntimeError(f"[{self.config.port}] PiPER is not in firmware leader mode.")
 
-        # In manual-control teleop, the operator physically backdrives the leader arm while a
-        # background gravity-compensation thread emits MIT commands. In that mode, `GetArmJointCtrl`
-        # reflects transmitted control targets rather than the operator's live pose, which can lag
-        # or jump under dual-arm load. Prefer direct joint feedback so teleop follows the real arm.
-        prefer_feedback = self._manual_control_enabled is True
-        if prefer_feedback:
-            self._wait_for_fresh_feedback_if_needed()
-            action = self._read_joint_from_feedback()
-            used_feedback_for_joints = action is not None
-            self._last_feedback_joint_timestamp = float(
-                getattr(self.arm.GetArmJointMsgs(), "time_stamp", 0.0) or 0.0
-            )
+        def read_calibration_pose():
+            action = self._read_leader_action()
+            return action if action is not None and "gripper.pos" in action else None
 
-        if action is None and self.config.prefer_ctrl_messages:
-            action = self._read_joint_from_ctrl()
-
-        if action is None and self.config.fallback_to_feedback and not used_feedback_for_joints:
-            action = self._read_joint_from_feedback()
-            used_feedback_for_joints = action is not None
-
-        if action is None:
-            action = {f"{joint_name}.pos": 0.0 for joint_name in PIPER_JOINT_NAMES}
-
-        use_ctrl_for_gripper = (
-            self.config.prefer_ctrl_messages and not prefer_feedback and not used_feedback_for_joints
-        )
-        gripper_pos = self._read_gripper_from_ctrl() if use_ctrl_for_gripper else None
-        if gripper_pos is None and self.config.fallback_to_feedback:
-            gripper_pos = self._read_gripper_from_feedback()
-            self._last_feedback_gripper_timestamp = float(
-                getattr(self.arm.GetArmGripperMsgs(), "time_stamp", 0.0) or 0.0
-            )
-        action["gripper.pos"] = 0.0 if gripper_pos is None else gripper_pos
-        return action
+        return self._wait_for(read_calibration_pose, "fresh leader joint and gripper frames for calibration")
 
     def _to_calibration_units(self, angle_deg: float) -> int:
         return int(round(angle_deg * self.config.calibration_scale))
@@ -419,24 +359,35 @@ class PiperLeader(Teleoperator):
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
+        action = self.get_action_if_ready()
+        if action is None:
+            raise RuntimeError(f"[{self.config.port}] PiPER leader has no fresh action.")
+        return action
+
+    @check_if_not_connected
+    def get_action_if_ready(self) -> RobotAction | None:
+        if self._manual_control_enabled is not True:
+            raise RuntimeError(f"[{self.config.port}] PiPER is not in firmware leader mode.")
         if not self.is_calibrated and not self._use_uncalibrated_passthrough():
             raise RuntimeError(
                 f"{self} is not calibrated. Run `lerobot-calibrate --teleop.type={self.config.type} --teleop.id={self.id}` first."
             )
 
-        raw_action = self._read_raw_action()
+        raw_action = self._read_leader_action()
+        if raw_action is None:
+            now = time.monotonic()
+            if now - self._last_leader_frame_warning >= 2.0:
+                assert self._can_feedback is not None
+                logger.warning(
+                    "[%s] PiPER leader joint snapshot unavailable: %s",
+                    self.config.port,
+                    self._can_feedback.leader_frame_status(since=self._role_requested_at),
+                )
+                self._last_leader_frame_warning = now
+            return None
         if self._use_uncalibrated_passthrough():
-            action: RobotAction = dict(raw_action)
-            if not self.config.sync_gripper:
-                action["gripper.pos"] = 0.0
-            return action
-
-        action: RobotAction = {
-            key: self._calibrated_to_offset(key, raw_action[key]) for key in PIPER_CALIB_KEYS
-        }
-        if not self.config.sync_gripper:
-            action["gripper.pos"] = 0.0
-        return action
+            return raw_action
+        return {key: self._calibrated_to_offset(key, value) for key, value in raw_action.items()}
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, Any]) -> None:
@@ -445,7 +396,19 @@ class PiperLeader(Teleoperator):
                 f"{self} is not calibrated. Run `lerobot-calibrate --teleop.type={self.config.type} --teleop.id={self.id}` first."
             )
 
-        self.set_manual_control(False)
+        if self._manual_control_enabled is not False:
+            raise RuntimeError(f"[{self.config.port}] PiPER must exit leader mode before accepting targets.")
+        assert self._can_feedback is not None
+        pose = self._can_feedback.joint_positions(since=self._role_requested_at)
+        if pose is None or self._can_feedback.ctrl_mode(since=self._role_requested_at) != PIPER_COMMAND_MODE:
+            if not self._mirror_waiting:
+                logger.warning(
+                    "[%s] Pausing PiPER leader mirroring until CAN position feedback is fresh",
+                    self.config.port,
+                )
+            self._mirror_waiting = True
+            return
+        self._mirror_waiting = False
         self._refresh_command_mode_if_needed()
 
         joint_keys = PIPER_JOINT_ACTION_KEYS
@@ -455,8 +418,7 @@ class PiperLeader(Teleoperator):
                 joint_targets = [feedback[key] for key in joint_keys]
             else:
                 joint_targets = [self._offset_to_calibrated(key, feedback[key]) for key in joint_keys]
-            joint_commands = [unit_to_milli(value) for value in joint_targets]
-            self.arm.JointCtrl(*joint_commands)
+            self.arm.JointCtrl(*(unit_to_milli(target) for target in joint_targets))
 
         if self.config.sync_gripper and "gripper.pos" in feedback:
             if self._use_uncalibrated_passthrough():
@@ -464,16 +426,25 @@ class PiperLeader(Teleoperator):
             else:
                 gripper_target = self._offset_to_calibrated("gripper.pos", feedback["gripper.pos"])
             gripper_pos_raw = unit_to_milli(gripper_target)
-            self._send_gripper_ctrl(gripper_pos_raw, enabled=True)
+            self._send_gripper_ctrl(gripper_pos_raw)
 
     @check_if_not_connected
     def disconnect(self) -> None:
         try:
-            self._stop_gravity_comp_loop_if_needed()
-            if self.config.disable_on_disconnect:
+            if self.config.disable_on_disconnect and self._manual_control_enabled is False:
                 self.arm.DisableArm(7)
         finally:
+            # Leave the firmware supporting the leader. An I/O fault should
+            # not switch its role or remove motor torque.
+            self._close_connection()
+
+    def _close_connection(self) -> None:
+        try:
             self.arm.DisconnectPort()
+        finally:
+            if self._can_feedback is not None:
+                self._can_feedback.close()
+                self._can_feedback = None
             self._is_connected = False
             self._manual_control_enabled = None
             logger.info("%s disconnected.", self)
@@ -482,4 +453,3 @@ class PiperLeader(Teleoperator):
 class PiperXLeader(PiperLeader):
     config_class = PiperXLeaderConfig
     name = "piperx_leader"
-    gravity_comp_urdf_relpath = DEFAULT_PIPERX_GRAVITY_URDF

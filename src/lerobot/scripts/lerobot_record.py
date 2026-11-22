@@ -63,9 +63,9 @@ lerobot-record \
 """
 
 import logging
-from datetime import datetime
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from pprint import pformat
 
@@ -553,9 +553,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             remote_policy_client.start()
             if cfg.collector_policy_id_policy in (None, cfg.remote_policy.pretrained_name_or_path):
                 collector_policy_id_policy = remote_policy_client.policy_id
+        uses_firmware_leader_mode = getattr(teleop, "uses_firmware_leader_mode", False)
+        if uses_firmware_leader_mode:
+            robot.set_teleop_joint_feedback()
         robot.connect()
         if teleop is not None:
-            teleop.connect()
+            if uses_firmware_leader_mode:
+                teleop.connect(for_policy=cfg.policy is not None or remote_policy_client is not None)
+            else:
+                teleop.connect()
         if remote_policy_client is not None and not rtc_recording:
             remote_policy_client.start()
         on_record_connected = getattr(cfg, "_on_record_connected", None)
@@ -586,7 +592,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["episode_outcome"] = None
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                record_loop(
+                recorded_steps = record_loop(
                     robot=robot,
                     events=events,
                     fps=cfg.dataset.fps,
@@ -613,6 +619,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
                 if rtc_recording:
                     remote_policy_client.pause()
+
+                if uses_firmware_leader_mode and recorded_steps == 0:
+                    logging.warning("No PiPER commands were recorded; discarding the empty episode.")
+                    dataset.clear_episode_buffer()
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    continue
 
                 episode_success = None
                 if cfg.enable_episode_outcome_labeling:
@@ -678,6 +691,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
                 dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
                 recorded_episodes += 1
+    except Exception:
+        if rtc_recording:
+            logging.exception("RTC rollout stopped because of an error")
+        raise
     finally:
         if cfg.dataset.storage == "pkl":
             _finish_pkl_recording(
