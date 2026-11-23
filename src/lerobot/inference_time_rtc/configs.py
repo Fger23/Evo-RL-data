@@ -132,6 +132,41 @@ class RTCRecoveryConfig:
 
 
 @dataclass
+class RTCRLTConfig:
+    """Optional Evo-RLT head, restricted to an episode step interval [start,end)."""
+
+    enabled: bool = False
+    checkpoint: str | None = None
+    start_step: int | None = None
+    end_step: int | None = None
+
+    def __post_init__(self):
+        if self.enabled and (not self.checkpoint or not self.checkpoint.strip()):
+            raise ValueError("rlt.enabled=true requires rlt.checkpoint on the RTC server")
+        for name in ("start_step", "end_step"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"rlt.{name} must be a non-negative integer")
+        if self.enabled and (self.start_step is None or self.end_step is None):
+            raise ValueError("rlt.enabled=true requires rlt.start_step and rlt.end_step")
+        if self.start_step is not None and self.end_step is not None and self.end_step <= self.start_step:
+            raise ValueError("rlt.end_step must be greater than rlt.start_step")
+
+    def active_at(self, step: int) -> bool:
+        return bool(
+            self.enabled and self.start_step is not None and self.end_step is not None
+            and self.start_step <= step < self.end_step
+        )
+
+
+def resolve_action_sg_window(window: int, *, rlt_enabled: bool) -> int:
+    """RLT takes priority over the optional S-G postprocessor."""
+    if window not in ACTION_SG_WINDOWS:
+        raise ValueError("action_sg_window must be 0, 5, or 7")
+    return 0 if rlt_enabled else window
+
+
+@dataclass
 class RTCClientConfig:
     robot: RobotConfig
     server_address: str = "localhost:8100"
@@ -151,6 +186,7 @@ class RTCClientConfig:
     pretrained_name_or_path: str | None = None
     policy_type: str | None = None
     recovery: RTCRecoveryConfig = field(default_factory=RTCRecoveryConfig)
+    rlt: RTCRLTConfig = field(default_factory=RTCRLTConfig)
 
     def __post_init__(self):
         if not self.server_address:
@@ -164,8 +200,10 @@ class RTCClientConfig:
             positive_finite(name, getattr(self, name))
         if self.duration_s is not None:
             positive_finite("duration_s", self.duration_s)
-        if self.action_sg_window not in ACTION_SG_WINDOWS:
-            raise ValueError("action_sg_window must be 0, 5, or 7")
+        self.rlt.__post_init__()
+        if self.rlt.enabled and self.policy_type not in (None, "pi05"):
+            raise ValueError("RLT requires pi05")
+        self.action_sg_window = resolve_action_sg_window(self.action_sg_window, rlt_enabled=self.rlt.enabled)
         self.rtc.__post_init__()
         if self.recovery.enabled and self.recovery.prefix_steps > self.rtc.execution_horizon:
             raise ValueError("recovery.prefix_steps must be <= rtc.execution_horizon")

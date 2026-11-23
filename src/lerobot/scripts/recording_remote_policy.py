@@ -28,13 +28,14 @@ from typing import TYPE_CHECKING, Any
 import grpc
 import torch
 
-from lerobot.inference_time_rtc.action_filter import ACTION_SG_WINDOWS
 from lerobot.inference_time_rtc.configs import (
     SUPPORTED_POLICIES,
     InferenceTimeRTCConfig,
     RTCRecoveryConfig,
+    RTCRLTConfig,
     normalize_policy_device,
     positive_finite,
+    resolve_action_sg_window,
 )
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import grpc_channel_options
@@ -77,6 +78,7 @@ class RemotePolicyRecordConfig:
     allow_late_splice: bool = False
     action_sg_window: int = 0
     recovery: RTCRecoveryConfig = field(default_factory=RTCRecoveryConfig)
+    rlt: RTCRLTConfig = field(default_factory=RTCRLTConfig)
 
     def __post_init__(self) -> None:
         if not self.enable:
@@ -94,6 +96,9 @@ class RemotePolicyRecordConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError("`remote_policy.actions_per_chunk` must be positive.")
         if self.backend == "rtc":
+            self.rlt.__post_init__()
+            if self.rlt.enabled and self.policy_type != "pi05":
+                raise ValueError("RLT requires pi05")
             if self.policy_type not in SUPPORTED_POLICIES:
                 raise ValueError(f"RTC supports {SUPPORTED_POLICIES}, got {self.policy_type}")
             self.policy_device = normalize_policy_device(self.policy_device)
@@ -102,8 +107,7 @@ class RemotePolicyRecordConfig:
                 raise ValueError("recovery.prefix_steps must be <= rtc.execution_horizon")
             positive_finite("remote_policy.connect_timeout_s", self.connect_timeout_s)
             positive_finite("remote_policy.rpc_timeout_s", self.rpc_timeout_s)
-            if self.action_sg_window not in ACTION_SG_WINDOWS:
-                raise ValueError("remote_policy.action_sg_window must be 0, 5, or 7")
+            self.action_sg_window = resolve_action_sg_window(self.action_sg_window, rlt_enabled=self.rlt.enabled)
             return
         if not 0 <= self.chunk_size_threshold <= 1:
             raise ValueError("`remote_policy.chunk_size_threshold` must be between 0 and 1.")

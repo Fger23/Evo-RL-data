@@ -152,6 +152,7 @@ def record_loop(
     acp_inference: ACPInferenceConfig | None = None,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
+    rlt_phase_annotations_enabled: bool = True,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -296,6 +297,16 @@ def record_loop(
 
     timestamp = 0 # 从录制开始到当前帧累计运行秒数
     step_idx = 0
+    rlt_phase = False
+    rlt_phase_id = -1
+    next_rlt_phase_id = 0
+    events["toggle_rlt_phase"] = False
+    rlt_phase_marking_enabled = (
+        rlt_phase_annotations_enabled
+        and dataset is not None
+        and {"complementary_info.rlt_phase", "complementary_info.rlt_phase_id"} <= dataset.features.keys()
+    )
+    events["rlt_phase_recording"] = rlt_phase_marking_enabled
     start_episode_t = time.perf_counter() # 录制开始的时间戳
     # action_filter = JointActionFilter(alpha=0.4)
     while timestamp < control_time_s:
@@ -304,6 +315,22 @@ def record_loop(
         if events["exit_early"]:
             events["exit_early"] = False
             break
+
+        if events.get("toggle_rlt_phase", False):
+            events["toggle_rlt_phase"] = False
+            if rlt_phase_marking_enabled:
+                rlt_phase = not rlt_phase
+                if rlt_phase:
+                    rlt_phase_id = next_rlt_phase_id
+                    next_rlt_phase_id += 1
+                else:
+                    rlt_phase_id = -1
+                logging.info(
+                    "RLT interval annotation: active=%s phase_id=%d timestep=%d (action source unchanged)",
+                    rlt_phase,
+                    rlt_phase_id,
+                    step_idx,
+                )
 
         if events.get("toggle_intervention", False):
             events["toggle_intervention"] = False
@@ -531,6 +558,7 @@ def record_loop(
             piper_takeover_forwarding = True
             piper_takeover_waiting = False
         executed_action = robot_action_to_send if _sent_action is None else _sent_action
+        actual_rlt_applied = False
         if rtc_recording:
             from lerobot.inference_time_rtc.logging_utils import log_action_event
 
@@ -552,6 +580,7 @@ def record_loop(
             elif last_rtc_target is None:
                 last_rtc_target = dict(robot_action_to_send)
             reservation = remote_policy_client.last_reservation if selected_from_policy else None
+            actual_rlt_applied = bool(getattr(reservation, "rlt_applied", False))
             log_action_event(
                 "sent_action",
                 request_id=None if reservation is None else reservation.request_id,
@@ -562,6 +591,9 @@ def record_loop(
                 state=intervention_state,
                 policy_action_available=act_processed_policy is not None,
                 holding=rtc_waiting,
+                rlt_phase=rlt_phase,
+                rlt_phase_id=rlt_phase_id,
+                rlt_applied=actual_rlt_applied,
                 sent_monotonic_ns=time.monotonic_ns(),
                 requested_action=dict(robot_action_to_send),
                 sent_action=None if _sent_action is None else dict(_sent_action),
@@ -590,6 +622,12 @@ def record_loop(
                 frame["complementary_info.policy_available"] = np.array(
                     [float(act_processed_policy is not None)], dtype=np.float32
                 )
+            if "complementary_info.rlt_phase" in dataset.features:
+                frame["complementary_info.rlt_phase"] = np.array([rlt_phase], dtype=np.bool_)
+            if "complementary_info.rlt_phase_id" in dataset.features:
+                frame["complementary_info.rlt_phase_id"] = np.array([rlt_phase_id], dtype=np.int64)
+            if "complementary_info.rlt_applied" in dataset.features:
+                frame["complementary_info.rlt_applied"] = np.array([actual_rlt_applied], dtype=np.bool_)
             if "complementary_info.collector_policy_id" in dataset.features:
                 frame["complementary_info.collector_policy_id"] = resolve_collector_policy_id(
                     intervention_enabled=intervention_enabled,
@@ -614,4 +652,12 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t ## 更新已录制时长
         step_idx += 1
 
+    if rlt_phase:
+        logging.info(
+            "RLT interval annotation: active=False phase_id=-1 timestep=%d closed_phase_id=%d episode_end=True",
+            step_idx,
+            rlt_phase_id,
+        )
+    events["rlt_phase_recording"] = False
+    events["toggle_rlt_phase"] = False
     return step_idx

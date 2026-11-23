@@ -76,16 +76,19 @@ class TTYKeyboardListener:
         intervention_toggle_key: str,
         episode_success_key: str | None,
         episode_failure_key: str | None,
+        rlt_phase_toggle_key: str | None = None,
     ):
         self.events = events
         self.intervention_toggle_key = intervention_toggle_key.lower()
         self.episode_success_key = episode_success_key.lower() if episode_success_key else None
         self.episode_failure_key = episode_failure_key.lower() if episode_failure_key else None
+        self.rlt_phase_toggle_key = rlt_phase_toggle_key.lower() if rlt_phase_toggle_key else None
         self._fd = sys.stdin.fileno()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._old_attrs = None
         self._last_intervention_time: float = 0.0
+        self._last_rlt_phase_time: float = 0.0
 
     def start(self):
         self._old_attrs = termios.tcgetattr(self._fd)
@@ -168,6 +171,15 @@ class TTYKeyboardListener:
             self._last_intervention_time = now
             print(f"'{self.intervention_toggle_key}' key pressed. Toggling intervention mode...")
             self.events["toggle_intervention"] = True
+        elif self.rlt_phase_toggle_key and normalized == self.rlt_phase_toggle_key:
+            if not self.events.get("rlt_phase_recording", False):
+                return
+            now = time.monotonic()
+            if now - self._last_rlt_phase_time < INTERVENTION_TOGGLE_COOLDOWN_S:
+                return
+            self._last_rlt_phase_time = now
+            self.events["toggle_rlt_phase"] = True
+            print(f"'{self.rlt_phase_toggle_key}' key pressed. Marking an RLT interval boundary...")
         elif self.episode_success_key and normalized == self.episode_success_key:
             print(f"'{self.episode_success_key}' key pressed. Marking episode as success and exiting loop...")
             self.events["episode_outcome"] = EPISODE_SUCCESS
@@ -333,6 +345,7 @@ def init_keyboard_listener(
     intervention_toggle_key: str = "i",
     episode_success_key: str | None = None,
     episode_failure_key: str | None = None,
+    rlt_phase_toggle_key: str | None = None,
 ):
     events = {}
     events["exit_early"] = False
@@ -340,9 +353,11 @@ def init_keyboard_listener(
     events["stop_recording"] = False
     events["toggle_intervention"] = False
     events["episode_outcome"] = None
+    events["toggle_rlt_phase"] = False
+    events["rlt_phase_recording"] = False
 
     listener = None
-    
+
     # 优先尝试使用TTYKeyboardListener（更可靠）
     if sys.stdin.isatty():
         try:
@@ -351,18 +366,20 @@ def init_keyboard_listener(
                 intervention_toggle_key=intervention_toggle_key,
                 episode_success_key=episode_success_key,
                 episode_failure_key=episode_failure_key,
+                rlt_phase_toggle_key=rlt_phase_toggle_key,
             )
             listener.start()
             logging.info("Using TTY keyboard listener (most reliable in terminal environments).")
             return listener, events
         except Exception as e:
             logging.warning(f"Failed to start TTY keyboard listener: {e}")
-    
+
     # 如果TTY失败，尝试pynput
     if not is_headless():
         try:
             from pynput import keyboard
             last_intervention_time = [0.0]
+            last_rlt_phase_time = [0.0]
 
             def on_press(key):
                 try:
@@ -384,6 +401,20 @@ def init_keyboard_listener(
                         last_intervention_time[0] = now
                         print(f"'{intervention_toggle_key}' key pressed. Toggling intervention mode...")
                         events["toggle_intervention"] = True
+                    elif (
+                        rlt_phase_toggle_key
+                        and hasattr(key, "char")
+                        and key.char
+                        and key.char.lower() == rlt_phase_toggle_key.lower()
+                    ):
+                        if not events.get("rlt_phase_recording", False):
+                            return
+                        now = time.monotonic()
+                        if now - last_rlt_phase_time[0] < INTERVENTION_TOGGLE_COOLDOWN_S:
+                            return
+                        last_rlt_phase_time[0] = now
+                        events["toggle_rlt_phase"] = True
+                        print(f"'{rlt_phase_toggle_key}' key pressed. Marking an RLT interval boundary...")
                     elif (
                         episode_success_key
                         and hasattr(key, "char")
@@ -409,7 +440,7 @@ def init_keyboard_listener(
             return listener, events
         except Exception as e:
             logging.warning(f"Failed to start pynput listener: {e}")
-    
+
     logging.warning("No keyboard listener available.")
     return listener, events
 

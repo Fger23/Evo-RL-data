@@ -790,9 +790,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         noise=None,
         num_steps=None,
+        return_prefix_features: bool = False,
         **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+        """Sample actions, optionally returning the same forward's final VLM prefix states.
+
+        The padding mask is True for valid image/language tokens. Keeping this
+        opt-in avoids retaining or transferring features in ordinary inference.
+        """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -815,7 +820,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        prefix_outputs, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -866,6 +871,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        if return_prefix_features:
+            prefix_features = prefix_outputs[0]
+            if prefix_features is None:
+                raise RuntimeError("PI05 prefix forward did not return final hidden states")
+            return x_t, prefix_features, prefix_pad_masks
         return x_t
 
     def denoise_step(
@@ -1319,6 +1329,29 @@ class PI05Policy(PreTrainedPolicy):
         actions = actions[:, :, :original_action_dim]
 
         return actions
+
+    @torch.no_grad()
+    def predict_action_chunk_with_features(
+        self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return normalized actions and final VLM features from one RTC forward.
+
+        Shapes are [B, H, A], [B, M, D], and [B, M]. No second vision or
+        language pass is needed. Clone outside the potentially compiled sampler
+        so a subsequent CUDA Graph replay cannot overwrite the returned tensors.
+        """
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+        actions, prefix_features, prefix_pad_masks = self.model.sample_actions(
+            images, img_masks, tokens, masks, return_prefix_features=True, **kwargs
+        )
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        return (
+            actions[:, :, :original_action_dim].clone(),
+            prefix_features.clone(),
+            prefix_pad_masks.to(dtype=torch.bool).clone(),
+        )
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.

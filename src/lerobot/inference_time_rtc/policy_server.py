@@ -22,10 +22,10 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import grpc_channel_options, receive_bytes_in_chunks
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .compile_warmup import CompileWarmupConfig, warmup
-from .configs import RTCServerConfig, normalize_policy_device, positive_finite
+from .configs import RTCServerConfig, normalize_policy_device, positive_finite, resolve_action_sg_window
 from .logging_utils import configure_logging
 from .modeling_rtc import InputGradientRTCProcessor
 from .observation_codec import decode_observation_images, lossless_jpeg_available, lossless_png_available
@@ -37,6 +37,8 @@ from .protocol import (
     OBSERVATION_PNG_HEADER,
     POLICY_TYPE_HEADER,
     PROTOCOL_VERSION,
+    RLT_HEADER,
+    RLT_PHASE_HEADER,
     SESSION_HEADER,
     RTCActionChunk,
     RTCObservation,
@@ -132,6 +134,7 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.busy = False
         self.last_request_id = -1
         self.last_activity = time.monotonic()
+        self.rlt_head = None
 
     def _set_loaded_model(self, config: RTCServerConfig, components):
         policy, preprocessor, postprocessor = components
@@ -290,6 +293,8 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             ("rtc-policy-device", self.device),
             (POLICY_TYPE_HEADER, self.config.policy_type),
             (CURRENT_POSE_RECOVERY_HEADER, "1"),
+            (RLT_HEADER, "1"),
+            (RLT_PHASE_HEADER, "1"),
         )
         if self.checkpoint_root is not None:
             ready += ((CHECKPOINT_SELECTION_HEADER, "1"),)
@@ -310,6 +315,10 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             ):
                 raise ValueError("Incompatible client; both sides must use inference_time_rtc v3")
             positive_finite("fps", instructions.fps)
+            if getattr(getattr(instructions, "rlt", None), "enabled", False):
+                instructions.action_sg_window = resolve_action_sg_window(
+                    instructions.action_sg_window, rlt_enabled=True
+                )
             image_codec = instructions.rtc.observation_image_codec
             if instructions.policy_type is not None and instructions.policy_type != self.config.policy_type:
                 raise ValueError(f"Server policy_type is {self.config.policy_type}")
@@ -395,6 +404,23 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     context.abort(grpc.StatusCode.CANCELLED, "RTC setup cancelled during warmup")
             else:
                 self._configure_model(instructions.rtc)
+            self.rlt_head = None
+            if getattr(getattr(instructions, "rlt", None), "enabled", False):
+                try:
+                    from .rlt.runtime import load_head, warmup_head
+
+                    self.rlt_head = load_head(self, instructions)
+                    # The feature-returning compile specialization is warmed
+                    # before the client is allowed to connect any hardware.
+                    if self.config.warmup_on_connect:
+                        warmup_head(self, instructions, is_active=context.is_active)
+                except (ValueError, TypeError, OSError) as exc:
+                    self.rlt_head = None
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Could not prepare RLT: {exc}")
+                except Exception as exc:
+                    self.rlt_head = None
+                    logger.exception("RLT setup failed")
+                    context.abort(grpc.StatusCode.INTERNAL, f"Could not prepare RLT: {exc}")
             self.instructions = instructions
             self.session_id = session_id
             self.pending = None
@@ -429,6 +455,10 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 raise ValueError("Expected an RTCObservation")
             if observation.request_id < 0 or observation.start_step < 0 or observation.inference_delay < 0:
                 raise ValueError("Request ID, start_step and inference_delay must be non-negative")
+            if getattr(getattr(instructions, "rlt", None), "enabled", False) and (
+                type(observation.episode_step) is not int or observation.episode_step < 0
+            ):
+                raise ValueError("Scheduled RLT requires a non-negative episode_step")
             prefix = observation.prev_chunk_left_over
             steps = observation.recovery_prefix_steps
             if type(steps) is not int or not 0 <= steps <= min(chunk_size, instructions.rtc.execution_horizon):
@@ -469,6 +499,13 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def _predict(self, request: RTCObservation, instructions: SessionInstructions) -> RTCActionChunk:
+        if getattr(getattr(instructions, "rlt", None), "enabled", False):
+            from .rlt.runtime import predict_chunk
+
+            return predict_chunk(self, request, instructions)
+        return self._predict_vla(request, instructions)
+
+    def _predict_vla(self, request: RTCObservation, instructions: SessionInstructions, *, with_features=False):
         observation = raw_observation_to_observation(
             request.observation, instructions.lerobot_features, self.policy.config.image_features
         )
@@ -524,7 +561,13 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             }
         # Do not use torch.inference_mode(): the RTC processor needs enable_grad().
         with torch.no_grad():
-            actions = self.policy.predict_action_chunk(observation, **policy_inputs)
+            if with_features:
+                actions, features, valid_mask = self.policy.predict_action_chunk_with_features(
+                    observation, **policy_inputs
+                )
+                proprio = observation[OBS_STATE].detach().float().clone()
+            else:
+                actions = self.policy.predict_action_chunk(observation, **policy_inputs)
             count = (
                 self.chunk_size if instructions.actions_per_chunk is None else instructions.actions_per_chunk
             )
@@ -543,6 +586,8 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 processed.detach().float().cpu().numpy().squeeze(0).copy(),
             )
         result.validate(self.action_dim)
+        if with_features:
+            return result, features, valid_mask, proprio
         return result
 
     def GetActions(self, request, context):  # noqa: N802

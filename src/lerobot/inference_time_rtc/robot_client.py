@@ -38,10 +38,13 @@ from .protocol import (
     CURRENT_POSE_RECOVERY_HEADER,
     POLICY_TYPE_HEADER,
     PROTOCOL_VERSION,
+    RLT_HEADER,
+    RLT_PHASE_HEADER,
     SESSION_HEADER,
     RTCActionChunk,
     RTCObservation,
     SessionInstructions,
+    validate_rlt_stage,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +60,7 @@ class _RecoveryCandidate:
 
 class RTCRobotClient:
     def __init__(self, config: RTCClientConfig, *, robot=None):
+        config.__post_init__()
         self.config = config
         self.robot = robot if robot is not None else make_robot_from_config(config.robot)
         self._action_names = tuple(self.robot.action_features)
@@ -90,6 +94,9 @@ class RTCRobotClient:
         self.session_started = False
         self.server_checkpoint = None
         self.request_id = 0
+        self._rlt_phase: bool | None = None
+        self._rlt_epoch = 0
+        self._phase_refresh = False
         self.latencies = deque(maxlen=config.rtc.latency_window)
         self.metadata = ((SESSION_HEADER, uuid.uuid4().hex),)
         self.channel = grpc.insecure_channel(
@@ -106,6 +113,10 @@ class RTCRobotClient:
                 "This client requires lerobot.inference_time_rtc.policy_server on a separate port"
             )
         check_observation_image_codec(self.config.rtc.observation_image_codec, ready)
+        if self.config.rlt.enabled and ready.get(RLT_HEADER) != "1":
+            raise RuntimeError("Restart the updated RTC server to use direct VLA RLT without S-G")
+        if self.config.rlt.enabled and ready.get(RLT_PHASE_HEADER) != "1":
+            raise RuntimeError("Restart the updated RTC server to use RLT step intervals")
         if self.config.recovery.enabled and ready.get(CURRENT_POSE_RECOVERY_HEADER) != "1":
             raise RuntimeError("Restart the updated RTC server to use current-pose recovery")
         checkpoint = self.config.pretrained_name_or_path
@@ -138,6 +149,8 @@ class RTCRobotClient:
             policy_device=self.config.policy_device,
             pretrained_name_or_path=checkpoint,
             policy_type=self.config.policy_type,
+            rlt=self.config.rlt if self.config.rlt.enabled else None,
+            action_sg_window=self.config.action_sg_window,
         )
         _, call = self.stub.SendPolicyInstructions.with_call(
             services_pb2.PolicySetup(data=pickle.dumps(instructions, protocol=pickle.HIGHEST_PROTOCOL)),
@@ -170,6 +183,8 @@ class RTCRobotClient:
         )
         if self.config.action_sg_window:
             logger.info("RTC action S-G requested_window=%d", self.config.action_sg_window)
+        if self.config.rlt.enabled:
+            logger.info("RLT mode: action S-G disabled; reference_source=RTC VLA")
         if self.server_checkpoint is not None:
             logger.info("RTC server checkpoint: %s", self.server_checkpoint)
 
@@ -215,6 +230,7 @@ class RTCRobotClient:
         if result.request_id != request.request_id or result.start_step != request.start_step:
             raise ValueError("Server returned a mismatched RTC request ID or timeline origin")
         result.validate(len(self.robot.action_features))
+        validate_rlt_stage(result, request, self.config.rlt, self.config.rtc.execution_horizon)
         if len(result.original_actions) != self.chunk_size:
             raise ValueError("Server returned an unexpected RTC chunk size")
         received = time.monotonic_ns()
@@ -245,30 +261,58 @@ class RTCRobotClient:
             action_names=tuple(self.robot.action_features),
             original_actions=result.original_actions,
             processed_actions=result.processed_actions,
+            **({"rlt_applied": result.rlt_applied, "rlt_action_mask": result.rlt_action_mask,
+                "episode_step": request.episode_step,
+                "rlt_reference_actions": result.rlt_reference_actions} if self.config.rlt.enabled else {}),
         )
         return result, elapsed
+
+    def _update_rlt_phase(self, step: int):
+        """Called under dispatch_lock; retain queued actions for RTC continuity."""
+        if not self.config.rlt.enabled:
+            return
+        phase = self.config.rlt.active_at(step)
+        if phase != self._rlt_phase:
+            self._rlt_epoch += 1
+            self._rlt_phase = phase
+            self._phase_refresh = True
+            self.refill_event.set()
+            logger.info("RLT phase episode_step=%s enabled=%s interval=[%s,%s) epoch=%s queue=%s",
+                        step, phase, self.config.rlt.start_step, self.config.rlt.end_step,
+                        self._rlt_epoch, self.buffer.qsize())
 
     def request_chunk(self):
         if self.buffer.draining:
             return
         # Capture the origin before acquisition so latency includes sensing and both RPCs.
-        start_step, prefix, started = self.buffer.snapshot()
+        with self._dispatch_lock:
+            start_step, prefix, started = self.buffer.snapshot()
+            self._update_rlt_phase(start_step)
+            phase_epoch = self._rlt_epoch
+            self._phase_refresh = False
         if self.config.recovery.enabled and started and prefix is None:
             self.stop_event.wait(1.0 / self.config.fps)
             return
         observation, begin, observation_ready = self._capture_observation()
         delay = self.config.rtc.inference_delay if prefix is None else self._delay_steps()
-        request = RTCObservation(self.request_id, start_step, observation, prefix, delay)
+        request = RTCObservation(
+            self.request_id, start_step, observation, prefix, delay, episode_step=start_step
+        )
         result, elapsed = self._exchange_chunk(request, begin, observation_ready)
         if self.stop_event.is_set():
             return
         prefix_steps = 0 if prefix is None else len(prefix)
         effective_horizon = min(prefix_steps, self.config.rtc.execution_horizon) if started else None
         try:
-            real_delay = self.buffer.merge(
-                result, prefix_horizon=effective_horizon, allow_late_splice=self.config.allow_late_splice,
-                drain_on_rejection=self.config.recovery.enabled,
-            )
+            with self._dispatch_lock:
+                if phase_epoch != self._rlt_epoch:
+                    logger.info("Discarded RTC result request=%s from an earlier RLT phase", result.request_id)
+                    self.refill_event.set()
+                    return
+                real_delay = self.buffer.merge(
+                    result, prefix_horizon=effective_horizon, allow_late_splice=self.config.allow_late_splice,
+                    drain_on_rejection=self.config.recovery.enabled,
+                )
         except RTCContinuityError as exc:
             self._log_splice()
             if self.config.recovery.enabled:
@@ -372,6 +416,7 @@ class RTCRobotClient:
             if self._pending_recovery is not None or start_step is None:
                 return
             source_request_id = self._last_verified_request_id
+            phase_epoch = self._rlt_epoch
         if source_request_id is None:
             logger.info("RTC recovery holding: last dispatched joint positions are unavailable or unverified")
             return
@@ -386,7 +431,8 @@ class RTCRobotClient:
         # During hold the motion clock is stopped. Guide every row of the short
         # recovery prefix, including when the configured attention schedule is ZEROS.
         request = RTCObservation(
-            self.request_id, start_step, observation, None, steps, recovery_prefix_steps=steps
+            self.request_id, start_step, observation, None, steps, recovery_prefix_steps=steps,
+            episode_step=start_step,
         )
         logger.info(
             "RTC recovery request=%s source_request=%s prefix_steps=%s source=current_pose",
@@ -398,7 +444,7 @@ class RTCRobotClient:
             return
 
         with self._dispatch_lock:
-            if self.buffer.motion_paused and not self.stop_event.is_set():
+            if phase_epoch == self._rlt_epoch and self.buffer.motion_paused and not self.stop_event.is_set():
                 self._pending_recovery = _RecoveryCandidate(result, source_request_id, steps, begin)
 
     def _commit_recovery(self) -> bool:
@@ -430,7 +476,7 @@ class RTCRobotClient:
                     continue
                 if self.buffer.draining:
                     continue
-                if self.buffer.qsize() <= self.config.rtc.queue_threshold:
+                if self._phase_refresh or self.buffer.qsize() <= self.config.rtc.queue_threshold:
                     self.request_chunk()
                     if self.buffer.motion_paused and not self.config.recovery.enabled:
                         # Pace diagnostic observations when there is no
@@ -468,6 +514,7 @@ class RTCRobotClient:
             sent_monotonic_ns=sent_at,
             requested_action=requested,
             sent_action=None if sent is None else dict(sent),
+            rlt_applied=reservation.rlt_applied,
         )
 
     def control_loop(self):
@@ -487,6 +534,8 @@ class RTCRobotClient:
                     skipped = 0
                 else:
                     skipped = max(0, math.floor((time.monotonic() - deadline) / interval))
+                step, _, _ = self.buffer.snapshot()
+                self._update_rlt_phase(step + skipped)
                 reservation = self.buffer.reserve(skipped_steps=skipped, pause_on_exhaustion=True)
                 if reservation is not None:
                     self._dispatch(reservation, skipped)

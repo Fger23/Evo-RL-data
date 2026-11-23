@@ -32,10 +32,13 @@ from .protocol import (
     CURRENT_POSE_RECOVERY_HEADER,
     POLICY_TYPE_HEADER,
     PROTOCOL_VERSION,
+    RLT_HEADER,
+    RLT_PHASE_HEADER,
     SESSION_HEADER,
     RTCActionChunk,
     RTCObservation,
     SessionInstructions,
+    validate_rlt_stage,
 )
 
 if TYPE_CHECKING:
@@ -55,6 +58,7 @@ class _ObservationSnapshot:
     started: bool
     observation: dict[str, Any]
     recovering: bool = False
+    episode_step: int | None = None
 
 
 class RTCPolicyActionClient:
@@ -96,6 +100,8 @@ class RTCPolicyActionClient:
         self._session_started = False
         self._active = False
         self._generation = 0
+        self._rlt_phase: bool | None = None
+        self._phase_refresh = False
         self._observation_sequence = 0
         self._last_request_sequence = -1
         self._latest_observation = None
@@ -114,6 +120,8 @@ class RTCPolicyActionClient:
 
     @property
     def policy_id(self) -> str:
+        if self.cfg.rlt.enabled:
+            return f"{self.cfg.pretrained_name_or_path}::rlt={self.cfg.rlt.checkpoint}"
         return self.server_checkpoint or self.cfg.pretrained_name_or_path or self.cfg.policy_type
 
     @property
@@ -165,6 +173,10 @@ class RTCPolicyActionClient:
         if ready.get("rtc-protocol") != PROTOCOL_VERSION:
             raise RuntimeError("RTC recording requires lerobot.inference_time_rtc.policy_server")
         check_observation_image_codec(self.cfg.rtc.observation_image_codec, ready)
+        if self.cfg.rlt.enabled and ready.get(RLT_HEADER) != "1":
+            raise RuntimeError("Restart the updated RTC server to use direct VLA RLT without S-G")
+        if self.cfg.rlt.enabled and ready.get(RLT_PHASE_HEADER) != "1":
+            raise RuntimeError("Restart the updated RTC server to use RLT step intervals")
         if self.cfg.recovery.enabled and ready.get(CURRENT_POSE_RECOVERY_HEADER) != "1":
             raise RuntimeError("RTC rollout recovery requires an RTC server with current-pose recovery support")
         if ready.get(CHECKPOINT_SELECTION_HEADER) != "1":
@@ -180,6 +192,8 @@ class RTCPolicyActionClient:
             policy_device=self.cfg.policy_device,
             pretrained_name_or_path=self.cfg.pretrained_name_or_path,
             policy_type=self.cfg.policy_type,
+            rlt=self.cfg.rlt if self.cfg.rlt.enabled else None,
+            action_sg_window=self.cfg.action_sg_window,
         )
         _, call = self.stub.SendPolicyInstructions.with_call(
             services_pb2.PolicySetup(data=pickle.dumps(instructions, protocol=pickle.HIGHEST_PROTOCOL)),
@@ -221,6 +235,8 @@ class RTCPolicyActionClient:
             self.chunk_size,
             self.fps,
         )
+        if self.cfg.rlt.enabled:
+            logger.info("RLT mode: action S-G disabled; reference_source=RTC VLA")
 
     def _restart_generation(self, *, active: bool) -> None:
         with self._condition:
@@ -231,6 +247,8 @@ class RTCPolicyActionClient:
             self._pending_recovery = None
             self._next_command_at = None
             self._last_reservation = None
+            self._rlt_phase = None
+            self._phase_refresh = False
             self._buffer = self._new_buffer()
             self._latencies.clear()
             if active:
@@ -272,6 +290,21 @@ class RTCPolicyActionClient:
             self._last_reservation = None
             if not self._active or self._error is not None or self._stop_event.is_set():
                 return None
+            if self.cfg.rlt.enabled:
+                phase = self.cfg.rlt.active_at(timestep)
+                if phase != self._rlt_phase:
+                    if self._rlt_phase is not None:
+                        # Keep the command queue/prefix, but consume and discard
+                        # an RPC started in the previous scheduled phase.
+                        self._generation += 1
+                        self._pending_recovery = None
+                        self._phase_refresh = True
+                    self._rlt_phase = phase
+                    logger.info(
+                        "RLT phase episode_step=%s enabled=%s interval=[%s,%s) generation=%s queue=%s",
+                        timestep, phase, self.cfg.rlt.start_step, self.cfg.rlt.end_step,
+                        self._generation, self._buffer.qsize(),
+                    )
             self._resume_pending_recovery(captured_at)
             # Use an observation acquired after the pause was latched.
             recovering = self.cfg.recovery.enabled and self._buffer.motion_paused
@@ -307,7 +340,7 @@ class RTCPolicyActionClient:
             self._observation_sequence += 1
             self._latest_observation = _ObservationSnapshot(
                 self._generation, self._observation_sequence, captured_at, start_step, prefix, started, raw,
-                recovering=recovering,
+                recovering=recovering, episode_step=timestep,
             )
             self._last_reservation = reservation
             self._condition.notify_all()
@@ -325,6 +358,7 @@ class RTCPolicyActionClient:
             chunk_index=reservation.chunk_index,
             skipped_steps=skipped,
             requested_action=command,
+            rlt_applied=reservation.rlt_applied,
         )
         return command
 
@@ -341,6 +375,7 @@ class RTCPolicyActionClient:
         request = RTCObservation(
             self._request_id, snapshot.start_step, snapshot.observation, snapshot.prefix, delay,
             recovery_prefix_steps=recovery_steps,
+            episode_step=snapshot.episode_step,
         )
         self._request_id += 1
         if snapshot.recovering:
@@ -374,6 +409,7 @@ class RTCPolicyActionClient:
         if result.request_id != request.request_id or result.start_step != snapshot.start_step:
             raise ValueError("Server returned a mismatched RTC request ID or timeline origin")
         result.validate(len(self.action_names))
+        validate_rlt_stage(result, request, self.cfg.rlt, self.cfg.rtc.execution_horizon)
         if len(result.original_actions) != self.chunk_size:
             raise ValueError("Server returned an unexpected RTC chunk size")
         elapsed = time.monotonic() - snapshot.captured_at
@@ -401,6 +437,9 @@ class RTCPolicyActionClient:
             action_names=self.action_names,
             original_actions=result.original_actions,
             processed_actions=result.processed_actions,
+            **({"rlt_applied": result.rlt_applied, "rlt_action_mask": result.rlt_action_mask,
+                "episode_step": snapshot.episode_step,
+                "rlt_reference_actions": result.rlt_reference_actions} if self.cfg.rlt.enabled else {}),
         )
         return result, elapsed
 
@@ -419,7 +458,7 @@ class RTCPolicyActionClient:
                 return latest.recovering
             if self._buffer.draining:
                 return False
-        return self._buffer.qsize() <= self.cfg.rtc.queue_threshold
+        return self._phase_refresh or self._buffer.qsize() <= self.cfg.rtc.queue_threshold
 
     def _recovery_observation_is_valid(self, snapshot: _ObservationSnapshot) -> bool:
         try:
@@ -438,6 +477,7 @@ class RTCPolicyActionClient:
                 needs_setup = self._needs_setup
                 snapshot = self._latest_observation
                 self._last_request_sequence = snapshot.sequence
+                self._phase_refresh = False
                 self._session_dirty = True
             try:
                 if needs_setup:
@@ -459,7 +499,7 @@ class RTCPolicyActionClient:
                 with self._condition:
                     if generation != self._generation or not self._active or self._stop_event.is_set():
                         logger.info(
-                            "Discarded RTC recording result request=%s from an earlier takeover",
+                            "Discarded RTC recording result request=%s from an earlier takeover or RLT phase",
                             result.request_id,
                         )
                         continue
@@ -503,7 +543,13 @@ class RTCPolicyActionClient:
                     if self._stop_event.is_set():
                         return
                     if generation != self._generation:
-                        logger.debug("Discarded RTC error from an earlier takeover", exc_info=True)
+                        # A failed RPC pair may leave an uploaded observation
+                        # pending. Phase changes retain the buffer, so unlike a
+                        # takeover they did not already schedule a session reset.
+                        self._needs_setup = True
+                        self._phase_refresh = True
+                        logger.debug("Discarded RTC error from an earlier takeover or RLT phase; resetting session",
+                                     exc_info=True)
                         continue
                     self._error = exc
                     self._needs_setup = True

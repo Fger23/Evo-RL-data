@@ -28,6 +28,7 @@ class RTCActionReservation:
     step: int
     chunk_index: int
     action: np.ndarray
+    rlt_applied: bool = False
 
 
 class RTCActionBuffer:
@@ -43,6 +44,7 @@ class RTCActionBuffer:
         self._chunk_offset = 0
         self.original: np.ndarray | None = None
         self.processed: np.ndarray | None = None
+        self._rlt_action_mask: np.ndarray | None = None
         self.last_splice: RTCSpliceDiagnostics | None = None
         self._motion_paused = False
         self._draining = False
@@ -121,15 +123,21 @@ class RTCActionBuffer:
                     f"RTC prefix continuity lost: actual_delay={delay} >= "
                     f"effective_horizon={prefix_horizon}; refusing to replace future actions"
                 )
-            processed, applied_window = filter_joint_targets(
-                chunk.processed_actions[delay:], self._joint_columns, self._sg_window
-            )
+            if getattr(chunk, "rlt_applied", False):
+                processed = chunk.processed_actions[delay:].copy()
+                applied_window = chunk.applied_sg_window
+            else:
+                processed, applied_window = filter_joint_targets(
+                    chunk.processed_actions[delay:], self._joint_columns, self._sg_window
+                )
             self._install_chunk(chunk, delay, processed, applied_window)
             return delay
 
     def _install_chunk(self, chunk, offset, processed, applied_window):
         self.original = chunk.original_actions[offset:].copy()
         self.processed = processed
+        mask = getattr(chunk, "rlt_action_mask", None)
+        self._rlt_action_mask = None if mask is None else mask[offset:].copy()
         self.applied_sg_window = applied_window
         self.origin = self.step
         self.last_request_id = chunk.request_id
@@ -146,7 +154,10 @@ class RTCActionBuffer:
         with self.lock:
             if not self._motion_paused or chunk.start_step != self.step or chunk.request_id <= self.last_request_id:
                 return False
-            processed, window = filter_joint_targets(chunk.processed_actions, self._joint_columns, self._sg_window)
+            if getattr(chunk, "rlt_applied", False):
+                processed, window = chunk.processed_actions.copy(), chunk.applied_sg_window
+            else:
+                processed, window = filter_joint_targets(chunk.processed_actions, self._joint_columns, self._sg_window)
             self._install_chunk(chunk, 0, processed, window)
             self.last_splice = None
             self._motion_paused = False
@@ -179,4 +190,7 @@ class RTCActionBuffer:
                 return None
             action = self.processed[index].copy()
             action.setflags(write=False)
-            return RTCActionReservation(self.last_request_id, step, self._chunk_offset + index, action)
+            rlt_applied = bool(self._rlt_action_mask[index]) if self._rlt_action_mask is not None else False
+            return RTCActionReservation(
+                self.last_request_id, step, self._chunk_offset + index, action, rlt_applied
+            )

@@ -128,7 +128,6 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.utils.constants import ACTION
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
-    is_headless,
     sanity_check_bimanual_piper_pair,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
@@ -231,6 +230,8 @@ class RecordConfig:
     intervention_state_machine_enabled: bool = True
     # Keyboard key used to toggle entering/leaving intervention.
     intervention_toggle_key: str = "i"
+    # Mark training intervals independently of intervention or inference mode.
+    rlt_phase_toggle_key: str = "r"
     # Whether to capture episode-level success/failure labels from keyboard.
     enable_episode_outcome_labeling: bool = False
     # Keyboard key to mark the current episode as success and end it.
@@ -274,6 +275,20 @@ class RecordConfig:
         sanity_check_bimanual_piper_pair(self.robot, self.teleop)
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
+        if (
+            not self.rlt_phase_toggle_key
+            or len(self.rlt_phase_toggle_key) != 1
+            or self.rlt_phase_toggle_key.isspace()
+        ):
+            raise ValueError("`rlt_phase_toggle_key` must be a single non-whitespace character.")
+        if self.rlt_phase_toggle_key.lower() in {
+            self.intervention_toggle_key.lower(),
+            self.episode_success_key.lower(),
+            self.episode_failure_key.lower(),
+        }:
+            raise ValueError(
+                "`rlt_phase_toggle_key` must be distinct from intervention and episode outcome keys."
+            )
 
         if self.enable_episode_outcome_labeling:
             label_key_bindings = {
@@ -438,6 +453,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         action_names = dataset_features[ACTION]["names"]
         action_names = list(robot.action_features) if action_names is None else list(action_names)
         _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
+    for name, dtype in (("rlt_phase", "bool"), ("rlt_phase_id", "int64"), ("rlt_applied", "bool")):
+        dataset_features[f"complementary_info.{name}"] = {
+            "dtype": dtype,
+            "shape": (1,),
+            "names": [name],
+        }
     if cfg.enable_collector_policy_id:
         dataset_features["complementary_info.collector_policy_id"] = {
             "dtype": "string",
@@ -459,6 +480,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     listener = None
     policy_sync_executor = None
     remote_policy_client = None
+    events = {}
+    rlt_phase_annotations_enabled = True
 
     try:
         cfg.remote_policy.rename_map = cfg.dataset.rename_map
@@ -486,6 +509,28 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
             )
+            rlt_feature_keys = {
+                "complementary_info.rlt_phase",
+                "complementary_info.rlt_phase_id",
+                "complementary_info.rlt_applied",
+            }
+            missing_rlt_features = rlt_feature_keys - dataset.features.keys()
+            if missing_rlt_features:
+                if rtc_recording and cfg.remote_policy.rlt.enabled:
+                    raise ValueError(
+                        "Cannot resume RLT recording into a legacy dataset missing RLT metadata; "
+                        "create a new capture with interval annotations. Existing rows are not migrated."
+                    )
+                # Preserve the old schema and historical rows exactly. Do not
+                # manufacture interval labels for recordings made before RLT.
+                for key in missing_rlt_features:
+                    dataset_features.pop(key, None)
+                rlt_phase_annotations_enabled = False
+                logging.warning(
+                    "Resuming a legacy dataset without complete RLT metadata: RLT interval marking is disabled. "
+                    "Create a new capture or explicitly annotate a separate dataset for RLT training; "
+                    "existing rows and schema are preserved."
+                )
 
             if hasattr(robot, "cameras") and len(robot.cameras) > 0:
                 dataset.start_image_writer(
@@ -585,12 +630,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             intervention_toggle_key=cfg.intervention_toggle_key,
             episode_success_key=cfg.episode_success_key if cfg.enable_episode_outcome_labeling else None,
             episode_failure_key=cfg.episode_failure_key if cfg.enable_episode_outcome_labeling else None,
+            rlt_phase_toggle_key=cfg.rlt_phase_toggle_key,
         )
 
         with action_logging, (nullcontext() if cfg.dataset.storage == "pkl" else VideoEncodingManager(dataset)):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["episode_outcome"] = None
+                events["toggle_rlt_phase"] = False
+                events["rlt_phase_recording"] = False
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 recorded_steps = record_loop(
                     robot=robot,
@@ -616,6 +664,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     acp_inference=cfg.acp_inference,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
+                    rlt_phase_annotations_enabled=rlt_phase_annotations_enabled,
                 )
                 if rtc_recording:
                     remote_policy_client.pause()
@@ -696,6 +745,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             logging.exception("RTC rollout stopped because of an error")
         raise
     finally:
+        events["rlt_phase_recording"] = False
+        events["toggle_rlt_phase"] = False
         if cfg.dataset.storage == "pkl":
             _finish_pkl_recording(
                 dataset=dataset,

@@ -23,7 +23,7 @@ import pytest
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.utils import build_dataset_frame
-from lerobot.inference_time_rtc.configs import InferenceTimeRTCConfig, RTCRecoveryConfig
+from lerobot.inference_time_rtc.configs import InferenceTimeRTCConfig, RTCRecoveryConfig, RTCRLTConfig
 from lerobot.robots.config import RobotConfig
 from lerobot.scripts.recording_remote_policy import RemotePolicyRecordConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
@@ -84,6 +84,7 @@ def config_module(monkeypatch):
         RemotePolicyRecordConfig=RemotePolicyRecordConfig,
         InferenceTimeRTCConfig=InferenceTimeRTCConfig,
         RTCRecoveryConfig=RTCRecoveryConfig,
+        RTCRLTConfig=RTCRLTConfig,
         parser=parser,
         sanity_check_bimanual_piper_pair=lambda *args: None,
         normalize_episode_success_label=normalize_episode_success_label,
@@ -142,6 +143,35 @@ def test_rollout_cli_maps_to_exact_record_config(config_module, monkeypatch):
     assert type(calls[0]) is config_module.RecordConfig
     assert calls[0].remote_policy is cfg.remote_policy
     assert calls[0].dataset.fps == 25
+    assert calls[0].rlt_phase_toggle_key == "r"
+
+
+@pytest.mark.parametrize("requested_sg_window", [0, 5, 7])
+def test_rollout_cli_disables_sg_for_rlt_and_keeps_png(config_module, requested_sg_window):
+    cfg = draccus.parse(
+        config_module.RTCRolloutConfig,
+        args=[
+            *cli_args(),
+            f"--action_sg_window={requested_sg_window}",
+            "--rlt.enabled=true",
+            "--rlt.checkpoint=/nfs/policy/rlt/actor.pt",
+            "--rlt.start_step=100",
+            "--rlt.end_step=250",
+        ],
+    )
+    assert cfg.remote_policy.rlt.enabled
+    assert cfg.remote_policy.rlt.checkpoint == "/nfs/policy/rlt/actor.pt"
+    assert cfg.remote_policy.rlt.start_step == 100
+    assert cfg.remote_policy.rlt.end_step == 250
+    assert cfg.remote_policy.action_sg_window == 0
+    assert cfg.remote_policy.rtc.observation_image_codec == "lossless_png"
+
+
+def test_rollout_cli_keeps_requested_sg_when_rlt_disabled(config_module):
+    cfg = draccus.parse(config_module.RTCRolloutConfig, args=[*cli_args(), "--action_sg_window=7"])
+    assert not cfg.remote_policy.rlt.enabled
+    assert cfg.remote_policy.action_sg_window == 7
+    assert cfg.remote_policy.rtc.observation_image_codec == "lossless_png"
 
 
 @pytest.mark.parametrize("option", ["--dataset.storage=lerobot", "--dataset.push_to_hub=true"])

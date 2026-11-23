@@ -8,7 +8,7 @@ from lerobot.scripts.lerobot_record import RecordConfig
 from lerobot.scripts.recording_remote_policy import RemotePolicyRecordConfig
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from .configs import InferenceTimeRTCConfig, RTCRecoveryConfig
+from .configs import InferenceTimeRTCConfig, RTCRecoveryConfig, RTCRLTConfig
 
 
 @dataclass
@@ -30,6 +30,7 @@ class RTCRolloutConfig(RecordConfig):
     allow_late_splice: bool = False
     action_sg_window: int = 0
     recovery: RTCRecoveryConfig = field(default_factory=lambda: RTCRecoveryConfig(enabled=True))
+    rlt: RTCRLTConfig = field(default_factory=RTCRLTConfig)
 
     def __post_init__(self):
         if self.teleop is None:
@@ -50,7 +51,9 @@ class RTCRolloutConfig(RecordConfig):
             allow_late_splice=self.allow_late_splice,
             action_sg_window=self.action_sg_window,
             recovery=self.recovery,
+            rlt=self.rlt,
         )
+        self.action_sg_window = self.remote_policy.action_sg_window
         super().__post_init__()
 
 
