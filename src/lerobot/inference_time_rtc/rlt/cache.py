@@ -341,7 +341,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="Output transition .pt file")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
-    parser.add_argument("--fps", type=float, default=25.0)
+    parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument(
         "--sg-window",

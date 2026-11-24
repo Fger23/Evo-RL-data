@@ -2,7 +2,9 @@
 
 本流程使用现有 InferenceTimeRTC PI0.5 作为冻结的 VLA，在指定步数区间内将 RTC VLA 的未滤波动作块直接交给 RLT，再把结果送入天钡动作队列。S-G 与 RLT 互斥：普通 RTC 保留 S-G，开启 RLT 会话后绕过滤波。你需要完成两端代码更新、带区间和结果标签的数据准备、离线训练和部署验证；不需要重新训练 VLA。
 
-示例沿用插卡任务、50 步动作块和 25 FPS，服务地址为 `10.61.5.1:8110`。整钞任务应同时更换模型、任务文本和训练数据，并单独训练对应的 RLT 头。当前 RLT 区间版代码在本地实现，本次没有自动完成服务器或天钡同步；实际部署前要按第 4 节更新两端，仅拉取此前的 `1122_rollout版` 备份分支不能取得尚未推送的新增文件。
+示例沿用插卡任务、50 步动作块和 30 FPS，服务地址为 `10.61.5.1:8110`。整钞任务应同时更换模型、任务文本和训练数据，并单独训练对应的 RLT 头。当前使用 `1123_rlt` 分支，包含 RLT 区间版及统一 30 FPS 的代码与指南；实际部署前仍需按第 4 节同步到运行的服务器和天钡，并核对两端版本与命令。
+
+日常执行请优先使用 [操作指南](操作指南.md) §1.10.7–§1.10.9：其中包含交互密码上传、按采集名称独立保存首轮产物、后续累计数据继续训练及退回旧 Actor/普通 RTC 的完整流程。本工作文档保留原理和固定训练目录示例，两种目录方式选定一种后应连续使用；新版逐轮流程从上一轮 Actor 同目录读取数据清单。首批 50 回合、后续每批 20–30 回合是试验安排，不是论文规定的数据量。
 
 ## 1 理解计算流程
 
@@ -68,7 +70,7 @@ RLT 开启时，服务器执行 VLA 和 RLT，天钡负责采集观测、上传 
 | 服务器地址与仓库 | `10.61.5.1`，`/home/baiyuntian/baiyuntian/Evo-RL-data-InferenceTimeRTC` |
 | 服务器 SSH | 用户 `baiyuntian`，端口 `2222` |
 | 模型 | `Remove1112_1_7_pi05/checkpoints/last/pretrained_model` |
-| 控制与保存频率 | 25 FPS；相机配置仍为 30 FPS |
+| 控制与保存频率 | 30 FPS；三路相机同为 30 FPS |
 | 动作块长度 | 50 步；双臂动作宽度从模型和数据自动读取 |
 | S-G | 普通 RTC：7 帧二阶；RLT：0，绕过滤波 |
 | RTC | horizon=20，delay=16，queue=30，guidance=10，EXP，auto_delay=false |
@@ -78,7 +80,9 @@ RLT 开启时，服务器执行 VLA 和 RLT，天钡负责采集观测、上传 
 
 模型路径、processor 统计、动作和状态名称顺序、相机配置、FPS、有效 S-G 窗口和 RTC 参数都会影响训练与部署是否匹配。RLT 的窗口固定为 0。本区间版 head 格式为 v2；旧版 S-G 参考产物和无区间掩码的 v1 cache/head 都不能直接复用，必须用带区间标注的数据重新编码并完成 token、AC 训练。本例使用 `*_phase_raw_v2` 文件名区分旧产物，下一轮实验使用 `*_phase_raw_v3`，文件名轮号不等于权重格式号。
 
-已有真实执行数据必须同时具备经过核对的逐帧区间标注，才能重新生成未滤波参考；没有区间标注时应重新采集或先完成逐帧补标，本工具没有一键推断区间的命令。仅有成功标签不足以用于本流程。25 FPS 数据必须真实以 25 FPS 录制；缓存命令不会自动把 30 FPS 数据重采样为 25 FPS。
+已有真实执行数据必须同时具备经过核对的逐帧区间标注，才能重新生成未滤波参考；没有区间标注时应重新采集或先完成逐帧补标，本工具没有一键推断区间的命令。仅有成功标签不足以用于本流程。当前统一使用真实 30 FPS 数据，不再按 25 FPS 采集或训练。已确认服务器 `Remove1112_1`～`Remove1112_7` 合计 209 回合，均为 30 FPS，可在核对并补齐区间标注后使用；已有其他频率的数据不能仅修改 FPS 元数据混入。缓存命令不会自动重采样。
+
+若已生成 25 FPS 的缓存或 RLT 权重，需要按 30 FPS 重新构建缓存并训练，不能直接改权重中的 FPS 合同。`training token` 和 `training ac` 从缓存读取频率，无需另加 FPS 参数。当前 50 步动作块约 1.667 秒，horizon=20 约 0.667 秒，delay=16 约 0.533 秒，queue=30 约 1 秒；本次不自动重调这些步数参数。
 
 ## 4 更新两端源码
 
@@ -239,7 +243,7 @@ run_rtc_rollout() {
     --dataset.repo_id="piper/$rtc_run" \
     --dataset.root="$rtc_capture" \
     --dataset.single_task="$rtc_task" \
-    --dataset.fps=25 \
+    --dataset.fps=30 \
     --dataset.num_episodes="${RTC_EPISODES:-50}" \
     --dataset.episode_time_s=240 \
     --dataset.reset_time_s=60 \
@@ -263,7 +267,7 @@ source /home/apex/.config/lerobot/rtc_rlt_client.sh
 
 ## 6 采集第零轮数据并上传
 
-如果已有同任务、同配置、带明确成功失败标签及逐帧 RLT 区间标注的 25 FPS 数据，可直接使用。旧数据缺少 `rlt_phase/rlt_phase_id` 时不能直接进入缓存训练。否则在天钡执行下面的启动命令。这一步会连接并控制机械臂；普通 RTC 仍使用 7 帧 S-G，RLT 此时关闭。
+如果已有同任务、同配置、带明确成功失败标签及逐帧 RLT 区间标注的 30 FPS 数据，可直接使用。旧数据缺少 `rlt_phase/rlt_phase_id` 时不能直接进入缓存训练。否则在天钡执行下面的启动命令。这一步会连接并控制机械臂；普通 RTC 仍使用 7 帧 S-G，RLT 此时关闭。
 
 ```bash
 source /home/apex/.config/lerobot/rtc_rlt_client.sh
@@ -413,7 +417,7 @@ python -m lerobot.inference_time_rtc.rlt.cache \
   --device "$rlt_train_device" \
   --dtype bfloat16 \
   --task "$rtc_task" \
-  --fps 25 \
+  --fps 30 \
   --chunk-size 50 \
   --sg-window 0 \
   --execution-horizon 20 \
@@ -437,7 +441,7 @@ python -m lerobot.inference_time_rtc.rlt.cache \
   --device "$rlt_train_device" \
   --dtype bfloat16 \
   --task "$rtc_task" \
-  --fps 25 \
+  --fps 30 \
   --chunk-size 50 \
   --sg-window 0 \
   --execution-horizon 20 \
@@ -495,7 +499,7 @@ python -m lerobot.inference_time_rtc.rlt.training ac \
 
 token 编码器在这一步冻结。双 Critic 使用全 episode 上下文，学习真实执行动作与结果的关系；Actor 仅更新标注区间内有效且未被前缀保护的行，同时优化 Q 值和靠近未滤波 VLA 参考的约束。区间外 Actor 和目标 Actor 都保留 VLA 参考。`beta` 越大越倾向于接近参考，减小会放宽偏离；平方差按有效可修改行的动作维度求和，不能照搬逐维均值损失的 beta 尺度。
 
-标注应覆盖需要优化的动作并留出衔接余量。当前 20 步前缀在 25 FPS 下约为 0.8 秒；若全部标注行都被前缀保护，AC 会明确报告没有可训练 Actor 行。应按任务扩大或重新选择标注片段，不要为了凑样本关闭前缀保护。短片段会被缓存采到，不代表一定存在未受保护的可训练行。
+标注应覆盖需要优化的动作并留出衔接余量。当前 20 步前缀在 30 FPS 下约为 0.667 秒；若全部标注行都被前缀保护，AC 会明确报告没有可训练 Actor 行。应按任务扩大或重新选择标注片段，不要为了凑样本关闭前缀保护。短片段会被缓存采到，不代表一定存在未受保护的可训练行。
 
 训练会实时打印 `critic_loss`、`actor_loss`、`bc_loss`，并定期原子保存同一个输出文件。结束时 `stage` 应为 `actor_critic`，`training_updates` 中 token、critic、actor 均应大于零。损失降低不能替代真实任务的成功率评估。
 
@@ -543,7 +547,7 @@ PY
 
 ## 10 在天钡启用 RLT
 
-确认第 9 节通过、8110 运行的是更新后的代码，再结束旧客户端。在天钡执行下面整段。这一步会连接并控制机械臂；先用少量 episode 检验新策略。启用 RLT 必须同时提供起止步数，采用 0 起算的半开区间 `[start_step,end_step)`。下例 `[100,250)` 在 25 FPS 下约对应第 4–10 秒，只是参数占位例，不是实测推荐，应按标注统计与真实动作替换。
+确认第 9 节通过、8110 运行的是更新后的代码，再结束旧客户端。在天钡执行下面整段。这一步会连接并控制机械臂；先用少量 episode 检验新策略。启用 RLT 必须同时提供起止步数，采用 0 起算的半开区间 `[start_step,end_step)`。下例 `[100,250)` 在 30 FPS 下约对应第 3.33–8.33 秒，只是参数占位例，不是实测推荐，应按标注统计与真实动作替换。
 
 ```bash
 source /home/apex/.config/lerobot/rtc_rlt_client.sh

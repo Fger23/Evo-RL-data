@@ -162,7 +162,7 @@ def setup_rlt(tmp_path):
     instructions = SessionInstructions(
         map_robot_keys_to_lerobot_features(robot),
         tuple(robot.action_features),
-        25,
+        30,
         rtc,
         actions_per_chunk=50,
         policy_device="cpu",
@@ -217,7 +217,7 @@ def test_real_grpc_rlt_first_and_continuation_preserve_actor_targets(setup_rlt, 
         assert "rtc-rlt-after-sg" not in dict(ready.initial_metadata())
         client = RTCRobotClient(
             RTCClientConfig(
-                robot=PiperFollowerConfig(port="unused"), server_address=address, fps=25, **options
+                robot=PiperFollowerConfig(port="unused"), server_address=address, fps=30, **options
             ),
             robot=robot,
         )
@@ -277,7 +277,7 @@ def test_real_grpc_rollout_records_rlt_policy_source(setup_rlt):
         client = RTCPolicyActionClient(
             RemotePolicyRecordConfig(enable=True, backend="rtc", server_address=address, **options),
             robot,
-            fps=25,
+            fps=30,
         )
         try:
             client.start()
@@ -310,7 +310,7 @@ def test_legacy_sg_rlt_server_is_rejected_before_robot_connect(setup_rlt, monkey
     with serve(service) as (address, _stub):
         client = RTCRobotClient(
             RTCClientConfig(
-                robot=PiperFollowerConfig(port="unused"), server_address=address, fps=25, **options
+                robot=PiperFollowerConfig(port="unused"), server_address=address, fps=30, **options
             ),
             robot=robot,
         )
@@ -332,12 +332,12 @@ def test_server_missing_interval_capability_is_rejected_before_hardware(setup_rl
             client = RTCPolicyActionClient(
                 RemotePolicyRecordConfig(enable=True, backend="rtc", server_address=address, **options),
                 robot,
-                fps=25,
+                fps=30,
             )
         else:
             client = RTCRobotClient(
                 RTCClientConfig(
-                    robot=PiperFollowerConfig(port="unused"), server_address=address, fps=25, **options
+                    robot=PiperFollowerConfig(port="unused"), server_address=address, fps=30, **options
                 ),
                 robot=robot,
             )
@@ -356,7 +356,7 @@ def test_real_grpc_off_on_off_mixed_chunks_and_protected_bypass(setup_rlt):
     with serve(service) as (address, _stub):
         client = RTCRobotClient(
             RTCClientConfig(
-                robot=PiperFollowerConfig(port="unused"), server_address=address, fps=25, **options
+                robot=PiperFollowerConfig(port="unused"), server_address=address, fps=30, **options
             ),
             robot=robot,
         )
@@ -410,7 +410,7 @@ def test_real_grpc_rejects_bad_rlt_before_robot_connect(setup_rlt, failure):
             RTCClientConfig(
                 robot=PiperFollowerConfig(port="unused"),
                 server_address=address,
-                fps=20 if failure == "contract_mismatch" else 25,
+                fps=20 if failure == "contract_mismatch" else 30,
                 **options,
             ),
             robot=robot,

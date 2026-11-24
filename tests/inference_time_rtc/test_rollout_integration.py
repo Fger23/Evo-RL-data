@@ -109,7 +109,7 @@ def cli_args():
         "--dataset.single_task=Move the card",
         "--dataset.storage=pkl",
         "--dataset.push_to_hub=false",
-        "--dataset.fps=25",
+        "--dataset.fps=30",
         "--server_address=10.61.5.1:8110",
         "--pretrained_name_or_path=/nfs/policy/checkpoints/last/pretrained_model",
         "--policy_device=cuda:1",
@@ -124,7 +124,7 @@ def cli_args():
 
 def test_rollout_cli_maps_to_exact_record_config(config_module, monkeypatch):
     cfg = draccus.parse(config_module.RTCRolloutConfig, args=cli_args())
-    assert cfg.dataset.fps == 25
+    assert cfg.dataset.fps == 30
     assert cfg.remote_policy.backend == "rtc"
     assert cfg.remote_policy.server_address == "10.61.5.1:8110"
     assert cfg.remote_policy.policy_device == "cuda:1"
@@ -142,7 +142,7 @@ def test_rollout_cli_maps_to_exact_record_config(config_module, monkeypatch):
     assert len(calls) == 1
     assert type(calls[0]) is config_module.RecordConfig
     assert calls[0].remote_policy is cfg.remote_policy
-    assert calls[0].dataset.fps == 25
+    assert calls[0].dataset.fps == 30
     assert calls[0].rlt_phase_toggle_key == "r"
 
 

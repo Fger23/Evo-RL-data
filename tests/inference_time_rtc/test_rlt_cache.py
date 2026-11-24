@@ -22,6 +22,7 @@ from lerobot.inference_time_rtc.rlt.cache import (
 
 def test_cache_defaults_to_unfiltered_reference_and_rejects_sg_cli():
     arguments = ["--base-model", "/models/pi05", "--dataset-spec", "datasets.json", "--output", "cache.pt"]
+    assert make_parser().parse_args(arguments).fps == 30.0
     assert make_parser().parse_args(arguments).sg_window == 0
     assert make_parser().parse_args([*arguments, "--sg-window", "0"]).sg_window == 0
     with pytest.raises(SystemExit):
