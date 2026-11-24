@@ -33,6 +33,7 @@ from .protocol import (
     POLICY_TYPE_HEADER,
     PROTOCOL_VERSION,
     RLT_HEADER,
+    RLT_OUTPUT_SG_HEADER,
     RLT_PHASE_HEADER,
     SESSION_HEADER,
     RTCActionChunk,
@@ -174,9 +175,11 @@ class RTCPolicyActionClient:
             raise RuntimeError("RTC recording requires lerobot.inference_time_rtc.policy_server")
         check_observation_image_codec(self.cfg.rtc.observation_image_codec, ready)
         if self.cfg.rlt.enabled and ready.get(RLT_HEADER) != "1":
-            raise RuntimeError("Restart the updated RTC server to use direct VLA RLT without S-G")
+            raise RuntimeError("Restart the updated RTC server to use direct VLA RLT")
         if self.cfg.rlt.enabled and ready.get(RLT_PHASE_HEADER) != "1":
             raise RuntimeError("Restart the updated RTC server to use RLT step intervals")
+        if self.cfg.rlt.enabled and self.cfg.action_sg_window and ready.get(RLT_OUTPUT_SG_HEADER) != "1":
+            raise RuntimeError("Restart the updated RTC server to use RLT with client output S-G")
         if self.cfg.recovery.enabled and ready.get(CURRENT_POSE_RECOVERY_HEADER) != "1":
             raise RuntimeError("RTC rollout recovery requires an RTC server with current-pose recovery support")
         if ready.get(CHECKPOINT_SELECTION_HEADER) != "1":
@@ -236,7 +239,7 @@ class RTCPolicyActionClient:
             self.fps,
         )
         if self.cfg.rlt.enabled:
-            logger.info("RLT mode: action S-G disabled; reference_source=RTC VLA")
+            logger.info("RLT mode: output_sg_window=%d; reference_source=raw RTC VLA", self.cfg.action_sg_window)
 
     def _restart_generation(self, *, active: bool) -> None:
         with self._condition:

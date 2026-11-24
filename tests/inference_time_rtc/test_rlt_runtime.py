@@ -125,9 +125,8 @@ def test_direct_vla_reference_and_actor_output_becomes_the_next_prefix(tmp_path,
     assert result.sg_reference_actions is None
     assert result.rlt_applied and result.applied_sg_window == 0
 
-    # Even though client SG=7 is still configured, no second filter can alter
-    # the actor output or desynchronize the next model-space prefix.
-    buffer = RTCActionBuffer(sg_window=7, joint_columns=(0,))
+    # With output S-G disabled the actor targets and normalized prefix are exact.
+    buffer = RTCActionBuffer(sg_window=0, joint_columns=(0,))
     if recovery:
         buffer.started = True
         buffer._motion_paused = True
@@ -288,6 +287,6 @@ def test_filtered_legacy_rlt_payload_cannot_enter_action_buffer(legacy_field):
     else:
         chunk.sg_reference_actions = actions.copy()
     buffer = RTCActionBuffer(sg_window=0, joint_columns=(0,))
-    with pytest.raises(ValueError, match="mutually exclusive"):
+    with pytest.raises(ValueError, match="server output must be unfiltered"):
         buffer.merge(chunk)
     assert buffer.qsize() == 0 and buffer.last_request_id == -1

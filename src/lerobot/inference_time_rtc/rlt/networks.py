@@ -76,10 +76,12 @@ def validate_contract(contract: dict, config: RLTHeadConfig) -> None:
         raise ValueError("RLT action_names must be nonempty strings")
     if not isinstance(contract["base_model_path"], str) or not contract["base_model_path"]:
         raise ValueError("RLT base_model_path is required")
-    if type(contract["sg_window"]) is not int or contract["sg_window"] != 0:
+    if type(contract["sg_window"]) is not int or contract["sg_window"] not in (0, 5, 7):
+        raise ValueError("RLT sg_window must be 0, 5, or 7")
+    if contract["sg_window"] and contract.get("sg_stage") != "client_output":
         raise ValueError(
-            "RLT requires sg_window=0 (unfiltered RTC VLA reference); "
-            "rebuild the cache and retrain old S-G heads"
+            "RLT S-G contract requires sg_stage=client_output; "
+            "rebuild the cache and retrain old S-G-reference heads"
         )
     if not isinstance(contract["fps"], (int, float)) or not 0 < contract["fps"] < math.inf:
         raise ValueError("RLT fps must be finite and positive")

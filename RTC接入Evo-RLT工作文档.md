@@ -1,6 +1,6 @@
 # RTC 接入 Evo-RLT 工作文档
 
-本流程使用现有 InferenceTimeRTC PI0.5 作为冻结的 VLA，在指定步数区间内将 RTC VLA 的未滤波动作块直接交给 RLT，再把结果送入天钡动作队列。S-G 与 RLT 互斥：普通 RTC 保留 S-G，开启 RLT 会话后绕过滤波。你需要完成两端代码更新、带区间和结果标签的数据准备、离线训练和部署验证；不需要重新训练 VLA。
+本流程使用现有 InferenceTimeRTC PI0.5 作为冻结 VLA，在指定区间将原始未滤波动作参考交给 RLT，随后由天钡对最终关节目标执行 S-G 并下发。基础与 RLT 阶段都请求 7 帧 S-G，夹爪和人工接管目标保持原逻辑。Windows 端侧从启动服务到再次采集的完整顺序见 [rlt 操作指南](rlt操作指南.md)。
 
 示例沿用插卡任务、50 步动作块和 30 FPS，服务地址为 `10.61.5.1:8110`。整钞任务应同时更换模型、任务文本和训练数据，并单独训练对应的 RLT 头。当前使用 `1123_rlt` 分支，包含 RLT 区间版及统一 30 FPS 的代码与指南；实际部署前仍需按第 4 节同步到运行的服务器和天钡，并核对两端版本与命令。
 
@@ -15,7 +15,7 @@ flowchart TD
     V --> T[视觉语言特征与 RL-token]
     N --> G{请求步数进入 RLT 区间?}
     G -->|是| A[RLT Actor]
-    G -->|否| D[还原目标并进入动作队列]
+    G -->|否| D[还原目标经客户端 S-G 后进入动作队列]
     T --> A
     O --> P[归一化关节状态]
     P --> A
@@ -24,7 +24,7 @@ flowchart TD
     F --> V
 ```
 
-Actor 的动作参考直接来自 RTC VLA 的输出，同时还接收 RL-token 表征和关节状态。RLT 头学习任务相关的动作改进，开启时不执行 S-G；普通 RTC 的 S-G 平滑路径继续保留。
+Actor 的动作参考直接来自 RTC VLA 的输出，同时还接收 RL-token 表征和关节状态。RLT 头学习任务相关的动作改进，开启后对最终目标执行 S-G；Actor 参考不滤波。
 
 这里有两种“前缀”，需要分清：
 
@@ -33,9 +33,9 @@ Actor 的动作参考直接来自 RTC VLA 的输出，同时还接收 RL-token �
 | RTC 动作前缀 | 上一块尚未执行的动作目标 | 引导下一块与现有计划衔接 |
 | VLA 视觉语言前缀特征 | 同一次 VLA 前向产生的最终隐藏状态 | 交给 RL-token 编码器提取状态表征 |
 
-RLT 开启时，服务器执行 VLA 和 RLT，天钡负责采集观测、上传 PNG、动作出队、机械臂下发、人工接管和 PKL 录制。VLA 与 RLT 使用天钡命令指定的服务器 GPU，两端都不对 RLT 路径执行 S-G。`rlt.enabled=true` 会自动把 S-G 窗口设为 0，兼容仍带 `--action_sg_window=7` 的旧命令；本流程的 RLT 命令仍显式设置为 0，避免混淆。
+RLT 开启时，服务器执行 VLA/Actor，天钡负责 PNG 观测上传、过期动作裁剪、输出 S-G、CAN 下发与录制。rlt.enabled 不再关闭 S-G，本流程显式请求 action_sg_window=7。Actor 参考始终未滤波，滤波只发生在最终出口。
 
-普通 RTC 中的 S-G 只平滑关节位置，保留夹爪通道。RLT 路径不做 S-G，Actor 预测整个动作向量，因此可以改变关节和夹爪目标。Actor 输出为绝对归一化目标，裁剪到 `[-1,1]` 后还原为物理目标；它不是对关节角叠加一个固定幅度的残差。
+S-G 只平滑关节位置，不处理夹爪。Actor 仍可预测整个动作向量，包括夹爪；Actor 输出是裁剪到 [-1,1] 的绝对归一化目标，还原为物理目标后才由客户端滤波，不是固定幅度残差。
 
 ## 2 查看实现入口
 
@@ -55,7 +55,7 @@ RLT 开启时，服务器执行 VLA 和 RLT，天钡负责采集观测、上传 
 
 普通续推中，Actor 保留前 `min(剩余前缀长度, execution_horizon)` 行 RTC VLA 参考，可修改的其余行还必须落在 RLT 区间内。当前 horizon=20、chunk=50 时，通常只有后 30 行中位于区间内的行可修改。首块无动作前缀，区间仍然生效；当前姿态恢复时保护 `recovery.prefix_steps` 行，默认 6 行。
 
-保护区保留的是经过 RTC 引导的 VLA 输出，不再执行 S-G；它不是把上一块动作硬拷贝到新块。RLT 修正后的归一化目标会成为下一次 RTC 前缀，避免继续引导到不再执行的旧 VLA 计划。
+Actor 在保护区保留 RTC VLA 参考，但之后的客户端 S-G 仍可能改变保护区或区间外相邻行。下一次 RTC 前缀沿用滤波前 VLA/Actor 的归一化计划，与普通 RTC 的输出滤波语义一致；它不是实际物理轨迹的硬约束。
 
 采集时按 `r` 标记需要学习片段的起止，按 `i` 仍进入已有人工接管流程，再按一次交回策略。`r` 只写训练标注，不临时切换部署中的 Actor。推理必须在命令中同时给出 `rlt.start_step` 和 `rlt.end_step`，服务器按区间逐行启用 Actor，区间外保留 RTC VLA 输出；目前没有自动识别关键阶段的模型。
 
@@ -72,13 +72,13 @@ RLT 开启时，服务器执行 VLA 和 RLT，天钡负责采集观测、上传 
 | 模型 | `Remove1112_1_7_pi05/checkpoints/last/pretrained_model` |
 | 控制与保存频率 | 30 FPS；三路相机同为 30 FPS |
 | 动作块长度 | 50 步；双臂动作宽度从模型和数据自动读取 |
-| S-G | 普通 RTC：7 帧二阶；RLT：0，绕过滤波 |
+| S-G | 普通 RTC 与 RLT：均为最终输出 7 帧二阶 |
 | RTC | horizon=20，delay=16，queue=30，guidance=10，EXP，auto_delay=false |
 | 部署区间 | `[100,250)` 仅为参数占位例；必须按采集标注估计实际步数 |
 | 观测传输 | lossless_png，压缩级别 1 |
 | GPU | 部署由天钡选择 `cuda:0`；示例离线编码和训练用 `cuda:1` |
 
-模型路径、processor 统计、动作和状态名称顺序、相机配置、FPS、有效 S-G 窗口和 RTC 参数都会影响训练与部署是否匹配。RLT 的窗口固定为 0。本区间版 head 格式为 v2；旧版 S-G 参考产物和无区间掩码的 v1 cache/head 都不能直接复用，必须用带区间标注的数据重新编码并完成 token、AC 训练。本例使用 `*_phase_raw_v2` 文件名区分旧产物，下一轮实验使用 `*_phase_raw_v3`，文件名轮号不等于权重格式号。
+模型路径、processor 统计、动作/状态顺序、FPS、S-G 和 RTC 参数必须匹配。head 仍为 v2；本次输出滤波要求 sg_window=7、sg_stage=client_output。无滤波旧头仅可继续用于窗口 0，旧先滤波参考头和 v1 头需重建。以下使用 phase_output_sg7_v2 文件名，后续轮次另用新文件/目录。
 
 已有真实执行数据必须同时具备经过核对的逐帧区间标注，才能重新生成未滤波参考；没有区间标注时应重新采集或先完成逐帧补标，本工具没有一键推断区间的命令。仅有成功标签不足以用于本流程。当前统一使用真实 30 FPS 数据，不再按 25 FPS 采集或训练。已确认服务器 `Remove1112_1`～`Remove1112_7` 合计 209 回合，均为 30 FPS，可在核对并补齐区间标注后使用；已有其他频率的数据不能仅修改 FPS 元数据混入。缓存命令不会自动重采样。
 
@@ -86,7 +86,7 @@ RLT 开启时，服务器执行 VLA 和 RLT，天钡负责采集观测、上传 
 
 ## 4 更新两端源码
 
-先正常结束正在运行的客户端、录制和 8110 服务，再更新文件。服务器和天钡都必须更新；新服务的 Ready 握手必须包含 `rtc-rlt-direct-vla=1` 和 `rtc-rlt-step-interval=1`，旧的“RLT 接在 S-G 后”或无步数区间的服务不可混用。下面只同步源码与文档，不包含数据集、模型、运行日志或编译缓存。
+先正常结束正在运行的客户端、录制和 8110 服务，再更新文件。服务器和天钡都必须更新；新服务的 Ready 握手必须包含 `rtc-rlt-direct-vla=1` 、`rtc-rlt-step-interval=1` 和 `rtc-rlt-output-sg=1`，旧的“RLT 接在 S-G 后”或无步数区间的服务不可混用。下面只同步源码与文档，不包含数据集、模型、运行日志或编译缓存。
 
 ### 在 Windows 打包当前工作目录
 
@@ -194,7 +194,7 @@ python -m lerobot.inference_time_rtc.policy_server \
 
 ### 天钡终端
 
-先保存下面的公共启动脚本。保存脚本只定义环境和命令，不启动机械臂。之后普通 RTC 和 RLT 共用相机、CAN 和 PNG 参数；S-G 默认 7 帧供普通 RTC 使用，RLT 调用时通过 `RTC_ACTION_SG_WINDOW=0` 显式关闭。
+先保存下面的公共启动脚本。保存脚本不启动机械臂；普通 RTC 和 RLT 共用相机、CAN、PNG 和默认 7 帧输出 S-G，RLT 调用也显式请求 RTC_ACTION_SG_WINDOW=7。
 
 ```bash
 mkdir -p /home/apex/.config/lerobot
@@ -208,7 +208,7 @@ export no_proxy=10.61.5.1,127.0.0.1,localhost
 
 rtc_model=/nfs/lerobot/piper/models/evo/policy/Remove1112_1_7_pi05/checkpoints/last/pretrained_model
 rtc_task='Remove the card from the slot and insert it into the card reader.'
-rlt_head=/nfs/lerobot/piper/models/evo/policy/rtc_rlt_Remove1112_1_7/actor_phase_raw_v2.pt
+rlt_head=/nfs/lerobot/piper/models/evo/policy/rtc_rlt_Remove1112_1_7/actor_phase_output_sg7_v2.pt
 
 run_rtc_rollout() {
   rtc_run="${1:?请提供本次采集名称}"
@@ -337,7 +337,7 @@ rlt_run=Remove_rtc_base_YYYYMMDD_HHMMSS
 rlt_dataset="/nfs/lerobot/piper/datasets/$rlt_run"
 rlt_repo="piper/$rlt_run"
 
-python - "$rlt_repo" "$rlt_dataset" "$rlt_root/datasets_phase_raw_v2.json" <<'PY'
+python - "$rlt_repo" "$rlt_dataset" "$rlt_root/datasets_phase_output_sg7_v2.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -412,14 +412,14 @@ PY
 ```bash
 python -m lerobot.inference_time_rtc.rlt.cache \
   --base-model "$rtc_model" \
-  --dataset-spec "$rlt_root/datasets_phase_raw_v2.json" \
-  --output "$rlt_root/cache_smoke_phase_raw_v2.pt" \
+  --dataset-spec "$rlt_root/datasets_phase_output_sg7_v2.json" \
+  --output "$rlt_root/cache_smoke_phase_output_sg7_v2.pt" \
   --device "$rlt_train_device" \
   --dtype bfloat16 \
   --task "$rtc_task" \
   --fps 30 \
   --chunk-size 50 \
-  --sg-window 0 \
+  --sg-window 7 \
   --execution-horizon 20 \
   --inference-delay 16 \
   --queue-threshold 30 \
@@ -429,21 +429,21 @@ python -m lerobot.inference_time_rtc.rlt.cache \
   --max-episodes 1
 ```
 
-成功后应看到 `Saved ... RLT transitions to ...cache_smoke_phase_raw_v2.pt`。它确认数据读取和模型前向可运行，不代表已经训练出 RLT。
+成功后应看到 `Saved ... RLT transitions to ...cache_smoke_phase_output_sg7_v2.pt`。它确认数据读取和模型前向可运行，不代表已经训练出 RLT。
 
 ### 再构建完整缓存
 
 ```bash
 python -m lerobot.inference_time_rtc.rlt.cache \
   --base-model "$rtc_model" \
-  --dataset-spec "$rlt_root/datasets_phase_raw_v2.json" \
-  --output "$rlt_root/transitions_phase_raw_v2.pt" \
+  --dataset-spec "$rlt_root/datasets_phase_output_sg7_v2.json" \
+  --output "$rlt_root/transitions_phase_output_sg7_v2.pt" \
   --device "$rlt_train_device" \
   --dtype bfloat16 \
   --task "$rtc_task" \
   --fps 30 \
   --chunk-size 50 \
-  --sg-window 0 \
+  --sg-window 7 \
   --execution-horizon 20 \
   --inference-delay 16 \
   --queue-threshold 30 \
@@ -467,8 +467,8 @@ Critic 的动作目标来自完整动作块的真实下发目标，并按原 che
 ```bash
 source /home/baiyuntian/.config/lerobot/rtc_rlt_server.sh
 python -m lerobot.inference_time_rtc.rlt.training token \
-  --cache "$rlt_root/transitions_phase_raw_v2.pt" \
-  --output "$rlt_root/token_phase_raw_v2.pt" \
+  --cache "$rlt_root/transitions_phase_output_sg7_v2.pt" \
+  --output "$rlt_root/token_phase_output_sg7_v2.pt" \
   --device "$rlt_train_device" \
   --steps 1000 \
   --batch-size 16 \
@@ -483,9 +483,9 @@ token 仅使用标注区间内起点的视觉语言特征做重建，区间外 C
 
 ```bash
 python -m lerobot.inference_time_rtc.rlt.training ac \
-  --cache "$rlt_root/transitions_phase_raw_v2.pt" \
-  --token-checkpoint "$rlt_root/token_phase_raw_v2.pt" \
-  --output "$rlt_root/actor_phase_raw_v2.pt" \
+  --cache "$rlt_root/transitions_phase_output_sg7_v2.pt" \
+  --token-checkpoint "$rlt_root/token_phase_output_sg7_v2.pt" \
+  --output "$rlt_root/actor_phase_output_sg7_v2.pt" \
   --device "$rlt_train_device" \
   --steps 10000 \
   --batch-size 32 \
@@ -511,7 +511,7 @@ token 编码器在这一步冻结。双 Critic 使用全 episode 上下文，学
 
 ```bash
 source /home/baiyuntian/.config/lerobot/rtc_rlt_server.sh
-python - "$rlt_root/cache_smoke_phase_raw_v2.pt" "$rlt_root/actor_phase_raw_v2.pt" <<'PY'
+python - "$rlt_root/cache_smoke_phase_output_sg7_v2.pt" "$rlt_root/actor_phase_output_sg7_v2.pt" <<'PY'
 import sys
 import torch
 from lerobot.inference_time_rtc.rlt.networks import RLTHeadBundle
@@ -543,7 +543,7 @@ PY
 
 预期为 `stage: actor_critic` 和完整的 `(1, 50, 动作维度)` 输出。第一行可能属于区间外 Critic 上下文，此时应完全保留 VLA；这也验证了区间掩码。此检查只验证文件、配置和前向计算；H200 上的时延、显存以及实机动作效果需要下一步评估。
 
-`actor_phase_raw_v2.pt` 是 PyTorch 权重包，不是 TorchScript、AOT 或 `.pt2` 可执行产物。部署时原来的 VLA 仍按服务端 `torch.compile` 设置运行。返回视觉语言特征的编译分支需要单独预热，服务器会在启用 RLT 的握手中自动完成。
+`actor_phase_output_sg7_v2.pt` 是 PyTorch 权重包，不是 TorchScript、AOT 或 `.pt2` 可执行产物。部署时原来的 VLA 仍按服务端 `torch.compile` 设置运行。返回视觉语言特征的编译分支需要单独预热，服务器会在启用 RLT 的握手中自动完成。
 
 ## 10 在天钡启用 RLT
 
@@ -551,15 +551,15 @@ PY
 
 ```bash
 source /home/apex/.config/lerobot/rtc_rlt_client.sh
-rlt_head=/nfs/lerobot/piper/models/evo/policy/rtc_rlt_Remove1112_1_7/actor_phase_raw_v2.pt
-RTC_EPISODES=5 RTC_ACTION_SG_WINDOW=0 run_rtc_rollout "Remove_rtc_rlt_phase_raw_v2_$(date +%Y%m%d_%H%M%S)" \
+rlt_head=/nfs/lerobot/piper/models/evo/policy/rtc_rlt_Remove1112_1_7/actor_phase_output_sg7_v2.pt
+RTC_EPISODES=5 RTC_ACTION_SG_WINDOW=7 run_rtc_rollout "Remove_rtc_rlt_phase_output_sg7_v2_$(date +%Y%m%d_%H%M%S)" \
   --rlt.enabled=true \
   --rlt.start_step=100 \
   --rlt.end_step=250 \
   --rlt.checkpoint="$rlt_head"
 ```
 
-`rlt_head` 是服务器可访问的绝对路径，天钡本地不需要复制模型文件。开关、权重、起止步数与 GPU 都由客户端提交。完整底层命令在第 5 节的函数内。本次调用把 `--action_sg_window` 设为 0，仍保留 `--rtc.observation_image_codec=lossless_png`。普通 RTC 不设置该环境变量时继续使用 7 帧 S-G；RLT 会话中即使位于配置区间外，S-G 也保持 0，不自动切回滤波。
+`rlt_head` 是服务器可访问的绝对路径，天钡不需要复制模型。开关、权重、区间、GPU 与 S-G 都由客户端提交。普通和 RLT 会话均请求输出 S-G7，包括 RLT 区间外；PNG 保留。
 
 rollout 的步数是每个 episode 实际写入数据集的逐帧索引，包含人工接管帧和保持帧；`i` 不会重置步数，新 episode 才从 0 开始。独立 `robot_client` 使用动作队列 timeline，跳过的 slots 计步，恢复暂停时冻结，两者不能直接按同一墙上时钟时间推断步数。服务器先检查请求锚点 `episode_step`：未到 start 或已到 end 时整块走 RTC VLA，不在 start 之前预计算未来 Actor。进入区间后，再根据 `episode_step+i` 与前缀保护生成逐行掩码，越过 end 的行保留 VLA。
 
@@ -572,11 +572,11 @@ rollout 的步数是每个 episode 实际写入数据集的逐帧索引，包含
 ```text
 RLT loaded direct VLA
 RLT feature-returning RTC warmup complete
-RLT request=... protected_steps=... sg_window=0 total_pipeline_ms=... episode_step=... actor_rows=... interval=[100,250)
+RLT request=... protected_steps=... sg_window=7 total_pipeline_ms=... episode_step=... actor_rows=... interval=[100,250)
 RLT bypass request=... episode_step=... interval=[100,250)
 ```
 
-天钡日志在仓库 `logs/rtc_rollout_*.log` 中。`action_chunk` 中的 `rlt_reference_actions` 是未滤波的物理 VLA 参考，`processed_actions` 是最终输出；结合逐行的 `rlt_action_mask`、`episode_step`、`sent_action` 与数据的 `complementary_info.rlt_applied` 核对实际使用。`rlt_applied` 表示本次该行被 Actor 直接替换；false 的前缀保护行仍可能继承此前 Actor 生成的目标，不代表没有历史 RLT 影响。采集标注 `rlt_phase` 与实际使用标记不是同一件事。协议中的旧兼容字段 `sg_reference_actions` 为 `None`，新日志不再输出该键。
+天钡日志在仓库 `logs/rtc_rollout_*.log` 中。`action_chunk` 中的 `rlt_reference_actions` 是未滤波的物理 VLA 参考，`processed_actions` 是滤波前服务端输出，最终目标看 filtered_action_chunk 和 sent_action；结合逐行的 `rlt_action_mask`、`episode_step`、`sent_action` 与数据的 `complementary_info.rlt_applied` 核对实际使用。`rlt_applied` 表示本次该行被 Actor 直接替换；false 的前缀保护行仍可能继承此前 Actor 生成的目标，不代表没有历史 RLT 影响。采集标注 `rlt_phase` 与实际使用标记不是同一件事。协议中的旧兼容字段 `sg_reference_actions` 为 `None`，新日志不再输出该键。
 
 ## 11 对照效果并继续下一轮
 
@@ -593,7 +593,7 @@ RLT bypass request=... episode_step=... interval=[100,250)
 
 本地已有无硬件回归测试不能替代这里的 H200 与实机对照。RLT 增加了计算，也可能使动作偏离原 VLA；不要直接使用此前纯 RTC 的测速结果推断新流程的余量。
 
-新 rollout 中仍按 `r` 标记片段，每回合至少一段，并用 `s/f` 标注结果。正常结束后按第 6 节转换并上传。在服务器的 `datasets_phase_raw_v3.json` 中同时保留本区间版旧数据和加入新数据；不要混入没有逐帧区间字段的旧采集。例如：
+新 rollout 中仍按 `r` 标记片段，每回合至少一段，并用 `s/f` 标注结果。正常结束后按第 6 节转换并上传。在服务器的 `datasets_phase_output_sg7_v3.json` 中同时保留本区间版旧数据和加入新数据；不要混入没有逐帧区间字段的旧采集。例如：
 
 ```json
 [
@@ -602,16 +602,16 @@ RLT bypass request=... episode_step=... interval=[100,250)
 ]
 ```
 
-按第 7 节完整缓存命令，将输入改为 `datasets_phase_raw_v3.json`，输出改为 `transitions_phase_raw_v3.pt`。训练命令只接受单个 `--cache` 文件，不能重复传入多个缓存来累计数据。
+按第 7 节完整缓存命令，将输入改为 `datasets_phase_output_sg7_v3.json`，输出改为 `transitions_phase_output_sg7_v3.pt`。训练命令只接受单个 `--cache` 文件，不能重复传入多个缓存来累计数据。
 
 保持 token 表征不变，在同一服务器工作环境中继续训练权重：
 
 ```bash
 source /home/baiyuntian/.config/lerobot/rtc_rlt_server.sh
 python -m lerobot.inference_time_rtc.rlt.training ac \
-  --cache "$rlt_root/transitions_phase_raw_v3.pt" \
-  --token-checkpoint "$rlt_root/actor_phase_raw_v2.pt" \
-  --output "$rlt_root/actor_phase_raw_v3.pt" \
+  --cache "$rlt_root/transitions_phase_output_sg7_v3.pt" \
+  --token-checkpoint "$rlt_root/actor_phase_output_sg7_v2.pt" \
+  --output "$rlt_root/actor_phase_output_sg7_v3.pt" \
   --device "$rlt_train_device" \
   --steps 5000 \
   --batch-size 32 \
@@ -623,7 +623,7 @@ python -m lerobot.inference_time_rtc.rlt.training ac \
   --save-every 1000
 ```
 
-这会继承权重并追加本次指定的更新次数，但重新建立 Adam 和 target critic，不是精确断点续训。token 子命令没有输入 checkpoint 的选项，每次都会新建 token 网络。通常在相同 VLA 和配置下，后续轮次只继续 AC，保留旧的 `actor_phase_raw_v2.pt` 便于对照和退回。
+这会继承权重并追加本次指定的更新次数，但重新建立 Adam 和 target critic，不是精确断点续训。token 子命令没有输入 checkpoint 的选项，每次都会新建 token 网络。通常在相同 VLA 和配置下，后续轮次只继续 AC，保留旧的 `actor_phase_output_sg7_v2.pt` 便于对照和退回。
 
 ## 12 常见问题和退回普通 RTC
 
@@ -638,7 +638,7 @@ python -m lerobot.inference_time_rtc.rlt.training ac \
 | 没有有效且未受保护的 Actor 行 | 标注太短或全部落入前缀保护区；覆盖真实优化动作并留出衔接余量，勿取消保护来凑样本 |
 | Dataset FPS 不匹配 | 使用真实匹配频率的数据；改命令里的 FPS 不能完成重采样 |
 | cache 输出已存在 | 使用新文件名；当前没有缓存追加或续建 |
-| `Checkpoint has no trained ...` | 检查部署文件是不是 `token_phase_raw_v2.pt`，或 AC 尚未产生有效保存 |
+| `Checkpoint has no trained ...` | 检查部署文件是不是 `token_phase_output_sg7_v2.pt`，或 AC 尚未产生有效保存 |
 | `contract mismatch` | 对照模型、processor、动作/状态顺序、FPS、SG 和 RTC 参数；改变配置后需重新编码和训练 |
 | RLT 文件不在 `checkpoint_root` 内 | 将输出放在本例的 `rlt_root` 中，或按需要调整服务端允许目录 |
 | 首次握手耗时长 | 查看服务端编译和预热日志；区分握手编译耗时与稳态推理耗时 |
@@ -657,11 +657,11 @@ run_rtc_rollout "Remove_rtc_baseline_$(date +%Y%m%d_%H%M%S)" --rlt.enabled=false
 
 | 文件 | 内容 | 可直接用于部署 |
 | --- | --- | --- |
-| `datasets_phase_raw_v2.json` | 输入数据集清单 | 否 |
-| `cache_smoke_phase_raw_v2.pt` | 小规模数据与模型前向验证产物 | 否 |
-| `transitions_phase_raw_v2.pt` | 完整 token 与 AC 训练输入 | 否 |
-| `token_phase_raw_v2.pt` | token 表征及训练记录 | 否 |
-| `actor_phase_raw_v2.pt` | token 与 Actor/Critic 权重、训练配置和计数 | 是，需通过匹配检查 |
+| `datasets_phase_output_sg7_v2.json` | 输入数据集清单 | 否 |
+| `cache_smoke_phase_output_sg7_v2.pt` | 小规模数据与模型前向验证产物 | 否 |
+| `transitions_phase_output_sg7_v2.pt` | 完整 token 与 AC 训练输入 | 否 |
+| `token_phase_output_sg7_v2.pt` | token 表征及训练记录 | 否 |
+| `actor_phase_output_sg7_v2.pt` | token 与 Actor/Critic 权重、训练配置和计数 | 是，需通过匹配检查 |
 | 天钡 `capture.pkl` 及 episode 分片 | 实际执行、接管、区间标注、实际 RLT 使用与任务结果 | 用于后续转换与训练 |
 | 两端 `logs/rtc_*.log` | RPC、动作块、实际下发目标和阶段耗时 | 用于诊断与对照 |
 

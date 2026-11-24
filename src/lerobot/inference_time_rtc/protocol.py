@@ -21,6 +21,7 @@ OBSERVATION_PNG_HEADER = "rtc-observation-lossless-png"
 CURRENT_POSE_RECOVERY_HEADER = "rtc-current-pose-recovery"
 RLT_HEADER = "rtc-rlt-direct-vla"
 RLT_PHASE_HEADER = "rtc-rlt-step-interval"
+RLT_OUTPUT_SG_HEADER = "rtc-rlt-output-sg"
 
 
 @dataclass
@@ -56,7 +57,7 @@ class RTCActionChunk:
     start_step: int
     original_actions: np.ndarray
     processed_actions: np.ndarray
-    # S-G and RLT are mutually exclusive. Never filter the actor's output.
+    # The server returns raw actor targets; the client applies output S-G once.
     rlt_applied: bool = False
     applied_sg_window: int = 0
     sg_reference_actions: np.ndarray | None = None
@@ -83,7 +84,7 @@ class RTCActionChunk:
                 raise ValueError("RLT marker must match the action row mask")
         if self.rlt_applied:
             if self.applied_sg_window != 0 or self.sg_reference_actions is not None:
-                raise ValueError("RLT and action S-G are mutually exclusive; update both RTC endpoints")
+                raise ValueError("RLT server output must be unfiltered; S-G belongs at the client output")
             reference = self.rlt_reference_actions
             if reference is not None and (
                 not isinstance(reference, np.ndarray)

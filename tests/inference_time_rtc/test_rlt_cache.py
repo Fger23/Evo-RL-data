@@ -20,20 +20,21 @@ from lerobot.inference_time_rtc.rlt.cache import (
 )
 
 
-def test_cache_defaults_to_unfiltered_reference_and_rejects_sg_cli():
+def test_cache_accepts_output_sg_without_filtering_vla_reference():
     arguments = ["--base-model", "/models/pi05", "--dataset-spec", "datasets.json", "--output", "cache.pt"]
     assert make_parser().parse_args(arguments).fps == 30.0
     assert make_parser().parse_args(arguments).sg_window == 0
     assert make_parser().parse_args([*arguments, "--sg-window", "0"]).sg_window == 0
+    assert make_parser().parse_args([*arguments, "--sg-window", "7"]).sg_window == 7
     with pytest.raises(SystemExit):
-        make_parser().parse_args([*arguments, "--sg-window", "7"])
+        make_parser().parse_args([*arguments, "--sg-window", "3"])
 
 
 def test_cache_api_rejects_filter_before_model_or_dataset_imports():
     # Deliberately omit all other fields: filter validation must precede any use
     # of model paths, datasets, camera backends, or the remaining arguments.
-    with pytest.raises(ValueError, match="--sg-window=0.*rebuild old S-G caches and retrain"):
-        build_cache(Namespace(sg_window=7))
+    with pytest.raises(ValueError, match="window must be 0, 5, or 7"):
+        build_cache(Namespace(sg_window=3))
 
 
 @pytest.mark.parametrize("value,expected", [(True, True), (0, False), ("success", True), ("failure", False)])

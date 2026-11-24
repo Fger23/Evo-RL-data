@@ -1,7 +1,7 @@
 """Feed the existing RTC VLA directly into an Evo-RLT head.
 
-S-G and RLT are mutually exclusive. The actor receives the unfiltered VLA
-reference in model coordinates; neither endpoint smooths the actor's output.
+The actor receives the unfiltered VLA reference in model coordinates. Optional
+S-G is applied once by the client after the actor and before command dispatch.
 """
 
 import hashlib
@@ -60,11 +60,9 @@ def processor_fingerprint(checkpoint: str) -> str:
 
 
 def build_contract(service, instructions) -> dict:
-    if instructions.action_sg_window != 0:
-        raise ValueError("RLT requires an unfiltered VLA reference (action_sg_window=0)")
     checkpoint = str(Path(service.model_config.pretrained_name_or_path).resolve())
     rtc = instructions.rtc
-    return {
+    contract = {
         "base_model_path": checkpoint,
         "action_names": list(instructions.action_names),
         "observation_state_names": list(
@@ -83,6 +81,9 @@ def build_contract(service, instructions) -> dict:
             "queue_threshold": rtc.queue_threshold,
         },
     }
+    if instructions.action_sg_window:
+        contract["sg_stage"] = "client_output"
+    return contract
 
 
 def normalize_actions(service, physical) -> torch.Tensor:
@@ -123,8 +124,6 @@ def prepare_reference(service, request, instructions):
     Cache generation and deployment share this single RTC forward. Preserve
     model-space values directly, without S-G or a decode/re-encode round trip.
     """
-    if instructions.action_sg_window != 0:
-        raise ValueError("RLT and action S-G are mutually exclusive; set action_sg_window=0")
     result, features, valid_mask, proprio = service._predict_vla(request, instructions, with_features=True)
     if valid_mask.shape != features.shape[:2]:
         raise ValueError("VLA features and prefix mask have incompatible shapes")

@@ -39,6 +39,7 @@ from .protocol import (
     POLICY_TYPE_HEADER,
     PROTOCOL_VERSION,
     RLT_HEADER,
+    RLT_OUTPUT_SG_HEADER,
     RLT_PHASE_HEADER,
     SESSION_HEADER,
     RTCActionChunk,
@@ -114,9 +115,11 @@ class RTCRobotClient:
             )
         check_observation_image_codec(self.config.rtc.observation_image_codec, ready)
         if self.config.rlt.enabled and ready.get(RLT_HEADER) != "1":
-            raise RuntimeError("Restart the updated RTC server to use direct VLA RLT without S-G")
+            raise RuntimeError("Restart the updated RTC server to use direct VLA RLT")
         if self.config.rlt.enabled and ready.get(RLT_PHASE_HEADER) != "1":
             raise RuntimeError("Restart the updated RTC server to use RLT step intervals")
+        if self.config.rlt.enabled and self.config.action_sg_window and ready.get(RLT_OUTPUT_SG_HEADER) != "1":
+            raise RuntimeError("Restart the updated RTC server to use RLT with client output S-G")
         if self.config.recovery.enabled and ready.get(CURRENT_POSE_RECOVERY_HEADER) != "1":
             raise RuntimeError("Restart the updated RTC server to use current-pose recovery")
         checkpoint = self.config.pretrained_name_or_path
@@ -184,7 +187,7 @@ class RTCRobotClient:
         if self.config.action_sg_window:
             logger.info("RTC action S-G requested_window=%d", self.config.action_sg_window)
         if self.config.rlt.enabled:
-            logger.info("RLT mode: action S-G disabled; reference_source=RTC VLA")
+            logger.info("RLT mode: output_sg_window=%d; reference_source=raw RTC VLA", self.config.action_sg_window)
         if self.server_checkpoint is not None:
             logger.info("RTC server checkpoint: %s", self.server_checkpoint)
 

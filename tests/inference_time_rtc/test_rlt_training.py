@@ -109,6 +109,39 @@ def test_reconstruction_actor_critic_update_and_roundtrip(tiny_cache, tmp_path):
     )
 
 
+def test_output_sg_training_evaluates_filtered_actor_and_target(tiny_cache, monkeypatch):
+    from lerobot.inference_time_rtc.rlt import training
+
+    tiny_cache["metadata"]["contract"].update(
+        sg_window=7, sg_stage="client_output", action_names=["joint.pos", "gripper.pos"]
+    )
+    tiny_cache["metadata"]["head_config"]["chunk_size"] = 10
+    tensors = tiny_cache["tensors"]
+    for key in ("reference_actions", "executed_actions", "next_reference_actions"):
+        tensors[key] = tensors[key].repeat(1, 3, 1)[:, :10]
+    for key in ("action_mask", "rlt_action_mask", "next_action_mask", "next_rlt_action_mask"):
+        tensors[key] = torch.ones(3, 10, dtype=torch.bool)
+    tensors["n_steps"] = torch.full((3,), 10)
+    tensors["rewards"] = torch.zeros(3, 10)
+    config, contract, tensors = validate_cache(tiny_cache, require_transitions=True)
+    bundle = RLTHeadBundle(config, contract)
+    train_token(bundle, tensors, steps=1, batch_size=2)
+    calls = []
+    real_filter = training.filter_joint_targets_tensor
+
+    def capture(actions, columns, window, valid):
+        result = real_filter(actions, columns, window, valid)
+        calls.append((window, columns, torch.equal(actions.detach(), result.detach())))
+        return result
+
+    monkeypatch.setattr(training, "filter_joint_targets_tensor", capture)
+    metrics = train_actor_critic(bundle, tensors, steps=1, batch_size=3)
+    assert len(calls) == 2 and all(window == 7 and columns == (0,) for window, columns, _ in calls)
+    assert any(not unchanged for _, _, unchanged in calls)
+    assert bundle.training_updates["actor"] == 1
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics[0].values())
+
+
 def test_td_target_uses_actual_steps_terminal_and_ignores_padded_rewards():
     rewards = torch.tensor([[1.0, 2.0, 999.0, 999.0], [0.0, 1.0, 999.0, 999.0]])
     result = td_target(
@@ -272,7 +305,7 @@ def test_old_filtered_cache_requires_rebuilding_before_training(tiny_cache, tmp_
     tiny_cache["metadata"]["contract"]["sg_window"] = 7
     path = tmp_path / "old_filtered_cache.pt"
     torch.save(tiny_cache, path)
-    with pytest.raises(ValueError, match="sg_window=0.*rebuild the cache and retrain"):
+    with pytest.raises(ValueError, match="sg_stage=client_output.*rebuild the cache and retrain"):
         load_cache(path, require_transitions=require_transitions)
 
 
@@ -283,7 +316,7 @@ def test_old_filtered_head_requires_retraining_before_loading(tiny_cache, tmp_pa
     checkpoint = torch.load(path, weights_only=True)
     checkpoint["contract"]["sg_window"] = 7
     torch.save(checkpoint, path)
-    with pytest.raises(ValueError, match="sg_window=0.*rebuild the cache and retrain"):
+    with pytest.raises(ValueError, match="sg_stage=client_output.*rebuild the cache and retrain"):
         RLTHeadBundle.load(path, require_actor=False)
 
 

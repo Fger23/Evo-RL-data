@@ -123,7 +123,7 @@ class RTCActionBuffer:
                     f"RTC prefix continuity lost: actual_delay={delay} >= "
                     f"effective_horizon={prefix_horizon}; refusing to replace future actions"
                 )
-            if getattr(chunk, "rlt_applied", False):
+            if not self._sg_window and getattr(chunk, "rlt_applied", False):
                 processed = chunk.processed_actions[delay:].copy()
                 applied_window = chunk.applied_sg_window
             else:
@@ -154,7 +154,7 @@ class RTCActionBuffer:
         with self.lock:
             if not self._motion_paused or chunk.start_step != self.step or chunk.request_id <= self.last_request_id:
                 return False
-            if getattr(chunk, "rlt_applied", False):
+            if not self._sg_window and getattr(chunk, "rlt_applied", False):
                 processed, window = chunk.processed_actions.copy(), chunk.applied_sg_window
             else:
                 processed, window = filter_joint_targets(chunk.processed_actions, self._joint_columns, self._sg_window)

@@ -160,10 +160,10 @@ class RTCRLTConfig:
 
 
 def resolve_action_sg_window(window: int, *, rlt_enabled: bool) -> int:
-    """RLT takes priority over the optional S-G postprocessor."""
+    """Preserve the requested output filter, including after the RLT actor."""
     if window not in ACTION_SG_WINDOWS:
         raise ValueError("action_sg_window must be 0, 5, or 7")
-    return 0 if rlt_enabled else window
+    return window
 
 
 @dataclass

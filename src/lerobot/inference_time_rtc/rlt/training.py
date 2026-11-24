@@ -7,7 +7,8 @@
 
 Caches are tensor-only .pt dictionaries with ``metadata.head_config``,
 ``metadata.contract`` and ``tensors``. References are the unfiltered RTC VLA
-chunks (sg_window=0). All actions and proprioception are already normalized by
+chunks. Optional client output S-G is included in actor/target Q evaluation.
+All actions and proprioception are already normalized by
 the VLA processors; images and robot control are never used here. Critic samples
 cover the full episode; token reconstruction selects only marked-start samples.
 Row masks restrict the actor/BC objective to those intervals while full-episode
@@ -26,6 +27,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
+from ..action_filter import filter_joint_targets_tensor
 from .networks import RLTHeadBundle, RLTHeadConfig, protect_prefix, validate_contract
 
 
@@ -231,8 +233,8 @@ def train_actor_critic(
     """Canonical clipped double-Q objective plus raw-VLA-reference BC regularization.
 
     The critic observes actual executed targets (including human actions), never
-    substituted VLA predictions. Actor/target/BC preserve the same protected RTC
-    rows and use VLA actions outside marked intervals. Invalid padded rows
+    substituted VLA predictions. Before output S-G, actor/target/BC preserve RTC
+    prefix rows and use VLA actions outside marked intervals. Invalid padded rows
     contribute neither Q input nor BC error; episode reward is never truncated
     at an interval boundary.
     """
@@ -253,6 +255,11 @@ def train_actor_critic(
             "enlarge marked intervals or check RTC prefix protection"
         )
     device = next(bundle.parameters()).device
+    sg_window = bundle.contract["sg_window"]
+    joint_columns = tuple(
+        index for index, name in enumerate(bundle.contract["action_names"])
+        if name.endswith(".pos") and not name.endswith("gripper.pos")
+    )
     bundle.rl_token.requires_grad_(False).eval()
     bundle.actor.requires_grad_(True).train()
     bundle.critic.requires_grad_(True).train()
@@ -283,7 +290,9 @@ def train_actor_critic(
                 training=False,
                 action_mask=batch["next_rlt_action_mask"],
             )
-            next_actions = next_actions * batch["next_action_mask"][:, :, None]
+            next_actions = filter_joint_targets_tensor(
+                next_actions, joint_columns, sg_window, batch["next_action_mask"]
+            ) * batch["next_action_mask"][:, :, None]
             next_q = target_critic.min_q(next_state, next_actions.flatten(1)).clamp(-100.0, 100.0)
             target = td_target(batch["rewards"], batch["n_steps"], batch["terminated"], next_q, gamma)
         executed = batch["executed_actions"] * batch["action_mask"][:, :, None]
@@ -323,8 +332,8 @@ def train_actor_critic(
                 action_mask=actor_marked,
             )
             proposed = proposed * actor_valid[:, :, None]
-            # Q sees exactly the bounded deployment action. BC uses the original
-            # mean so an out-of-range actor still receives a restoring gradient.
+            # Bound the actor first, then apply the output filter before Q. BC
+            # uses the raw mean so out-of-range outputs keep a restoring gradient.
             bounded = (
                 protect_prefix(
                     proposed.clamp(-1.0, 1.0),
@@ -334,6 +343,7 @@ def train_actor_critic(
                 )
                 * actor_valid[:, :, None]
             )
+            bounded = filter_joint_targets_tensor(bounded, joint_columns, sg_window, actor_valid)
             actor_q = bundle.critic.min_q(actor_state, bounded.flatten(1))
             # Sum over chunk/action dimensions, as in Evo-RLT's canonical beta convention.
             reference = actor_reference * actor_valid[:, :, None]

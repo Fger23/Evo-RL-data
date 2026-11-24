@@ -147,7 +147,7 @@ def test_rollout_cli_maps_to_exact_record_config(config_module, monkeypatch):
 
 
 @pytest.mark.parametrize("requested_sg_window", [0, 5, 7])
-def test_rollout_cli_disables_sg_for_rlt_and_keeps_png(config_module, requested_sg_window):
+def test_rollout_cli_keeps_output_sg_for_rlt_and_keeps_png(config_module, requested_sg_window):
     cfg = draccus.parse(
         config_module.RTCRolloutConfig,
         args=[
@@ -163,7 +163,7 @@ def test_rollout_cli_disables_sg_for_rlt_and_keeps_png(config_module, requested_
     assert cfg.remote_policy.rlt.checkpoint == "/nfs/policy/rlt/actor.pt"
     assert cfg.remote_policy.rlt.start_step == 100
     assert cfg.remote_policy.rlt.end_step == 250
-    assert cfg.remote_policy.action_sg_window == 0
+    assert cfg.remote_policy.action_sg_window == requested_sg_window
     assert cfg.remote_policy.rtc.observation_image_codec == "lossless_png"
 
 

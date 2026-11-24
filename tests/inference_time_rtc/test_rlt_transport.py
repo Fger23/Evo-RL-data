@@ -23,6 +23,7 @@ from lerobot.inference_time_rtc.configs import (
 from lerobot.inference_time_rtc.policy_server import RTCPolicyServer
 from lerobot.inference_time_rtc.protocol import (
     RLT_HEADER,
+    RLT_OUTPUT_SG_HEADER,
     RLT_PHASE_HEADER,
     RTCObservation,
     SessionInstructions,
@@ -200,7 +201,7 @@ def setup_rlt(tmp_path):
         "policy_type": "pi05",
         "policy_device": "cpu",
         "actions_per_chunk": 50,
-        "action_sg_window": 7,
+        "action_sg_window": 0,
         "rtc": rtc,
         "rlt": rlt,
     }
@@ -233,9 +234,8 @@ def test_real_grpc_rlt_first_and_continuation_preserve_actor_targets(setup_rlt, 
         try:
             client.start()
             assert robot.connected and robot.connect_calls == 1
-            # Existing commands containing SG=7 remain accepted, but enabling
-            # RLT disables smoothing before advertising the session contract.
-            assert options["action_sg_window"] == 7
+            # The window-zero configuration remains backwards compatible.
+            assert options["action_sg_window"] == 0
             assert client.config.action_sg_window == 0
             assert service.instructions.action_sg_window == 0
             assert service.instructions.policy_device == "cpu"
@@ -282,7 +282,7 @@ def test_real_grpc_rollout_records_rlt_policy_source(setup_rlt):
         try:
             client.start()
             assert not robot.connected  # Recording loop owns hardware connection.
-            assert options["action_sg_window"] == 7
+            assert options["action_sg_window"] == 0
             assert client.cfg.action_sg_window == 0
             assert service.instructions.action_sg_window == 0
             assert (
@@ -300,6 +300,64 @@ def test_real_grpc_rollout_records_rlt_policy_source(setup_rlt):
             action = client.get_action(observation, "test", 1)
             assert action == dict(zip(robot.action_features, actor_targets[0].tolist(), strict=True))
             assert client.last_reservation.request_id == 0
+        finally:
+            client.stop()
+
+
+@pytest.mark.parametrize("recording", [False, True])
+def test_rlt_with_output_sg_over_real_grpc(setup_rlt, recording):
+    service, _policy, robot, options, actor_targets = setup_rlt
+    options["action_sg_window"] = 7
+    head = RLTHeadBundle.load(options["rlt"].checkpoint)
+    head.contract.update(sg_window=7, sg_stage="client_output")
+    head.save(options["rlt"].checkpoint)
+    expected, _ = filter_joint_targets(actor_targets, (0,), 7)
+    with serve(service) as (address, stub):
+        _, ready = stub.Ready.with_call(services_pb2.Empty(), timeout=5)
+        assert dict(ready.initial_metadata())[RLT_OUTPUT_SG_HEADER] == "1"
+        if recording:
+            client = RTCPolicyActionClient(
+                RemotePolicyRecordConfig(enable=True, backend="rtc", server_address=address, **options),
+                robot, fps=30,
+            )
+        else:
+            client = RTCRobotClient(
+                RTCClientConfig(robot=PiperFollowerConfig(port="unused"), server_address=address, **options),
+                robot=robot,
+            )
+        try:
+            client.start()
+            if recording:
+                client.get_action(robot.get_observation(), "test", 0)
+                deadline = time.monotonic() + 5
+                while not client.action_ready and client.error is None and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                assert client.error is None and client.action_ready
+                buffer = client._buffer
+            else:
+                client.request_chunk()
+                buffer = client.buffer
+            assert service.instructions.action_sg_window == 7
+            assert buffer.applied_sg_window == 7
+            np.testing.assert_allclose(buffer.processed, expected, atol=1e-6)
+            np.testing.assert_array_equal(buffer.processed[:, 1], actor_targets[:, 1])
+            assert not np.allclose(buffer.processed[:, 0], actor_targets[:, 0])
+        finally:
+            client.stop()
+
+
+def test_old_server_cannot_silently_disable_requested_rlt_output_sg(setup_rlt, monkeypatch):
+    service, _policy, robot, options, _target = setup_rlt
+    options["action_sg_window"] = 7
+    monkeypatch.setattr(server_module, "RLT_OUTPUT_SG_HEADER", "unsupported-output-sg")
+    with serve(service) as (address, _stub):
+        client = RTCRobotClient(
+            RTCClientConfig(robot=PiperFollowerConfig(port="unused"), server_address=address, **options), robot=robot
+        )
+        try:
+            with pytest.raises(RuntimeError, match="client output S-G"):
+                client.start()
+            assert robot.connect_calls == 0
         finally:
             client.stop()
 

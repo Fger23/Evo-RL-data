@@ -5,7 +5,8 @@ not a robot or a network server. Reference continuation is a causal, offline
 counterfactual: leftovers from an earlier sampled reference are advanced along
 the recorded observation timeline. It does not reconstruct network queue timing.
 Critic targets always contain the recorded executed commands, never VLA samples.
-RLT excludes S-G filtering: both cache construction and deployment require sg_window=0.
+VLA references stay unfiltered. The contract records optional client output S-G,
+which training includes in actor/target Q evaluation rather than in VLA references.
 Explicit per-frame RLT phase labels are required. Unmarked frames supply critic
 and TD context, while token/actor learning is restricted by the marked masks.
 """
@@ -346,9 +347,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sg-window",
         type=int,
-        choices=(0,),
+        choices=(0, 5, 7),
         default=0,
-        help="Must be 0: RLT consumes unfiltered RTC VLA references and excludes S-G filtering",
+        help="Client output S-G window after the actor; VLA references remain unfiltered",
     )
     parser.add_argument("--execution-horizon", type=int, default=20)
     parser.add_argument("--inference-delay", type=int, default=16)
@@ -369,10 +370,9 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def build_cache(args: argparse.Namespace) -> dict:
-    if type(args.sg_window) is not int or args.sg_window != 0:
+    if type(args.sg_window) is not int or args.sg_window not in (0, 5, 7):
         raise ValueError(
-            "RLT requires --sg-window=0 and unfiltered RTC VLA references; "
-            "rebuild old S-G caches and retrain the heads"
+            "RLT output S-G window must be 0, 5, or 7"
         )
     # Imports stay here: inspecting cache tensors never loads camera/robot SDKs.
     from lerobot.configs.types import RTCAttentionSchedule

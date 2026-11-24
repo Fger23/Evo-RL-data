@@ -38,6 +38,7 @@ from .protocol import (
     POLICY_TYPE_HEADER,
     PROTOCOL_VERSION,
     RLT_HEADER,
+    RLT_OUTPUT_SG_HEADER,
     RLT_PHASE_HEADER,
     SESSION_HEADER,
     RTCActionChunk,
@@ -295,6 +296,7 @@ class RTCPolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             (CURRENT_POSE_RECOVERY_HEADER, "1"),
             (RLT_HEADER, "1"),
             (RLT_PHASE_HEADER, "1"),
+            (RLT_OUTPUT_SG_HEADER, "1"),
         )
         if self.checkpoint_root is not None:
             ready += ((CHECKPOINT_SELECTION_HEADER, "1"),)
